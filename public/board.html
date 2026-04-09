@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Winning Circle — Board (Read Only)</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1117; --surface: #1a1d27; --surface2: #242836;
+  --border: #2e3348; --text: #e4e7f1; --text-dim: #8b8fa7;
+  --accent: #6366f1; --green: #22c55e; --yellow: #eab308; --red: #ef4444; --blue: #3b82f6;
+  --radius: 10px; --radius-sm: 6px;
+}
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+.header { padding: 20px 24px; border-bottom: 1px solid var(--border); background: var(--surface); display: flex; align-items: center; justify-content: space-between; }
+.header-left { display: flex; align-items: center; gap: 12px; }
+.logo { width: 36px; height: 36px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; color: #fff; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.badge { background: var(--surface2); padding: 4px 10px; border-radius: 12px; font-size: 12px; color: var(--text-dim); }
+.badge.readonly { border: 1px solid var(--border); }
+.auto-refresh { font-size: 12px; color: var(--text-dim); }
+.header-right { display: flex; align-items: center; gap: 14px; }
+.user-info { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim); }
+.user-info img { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--border); object-fit: cover; }
+.user-info .avatar-fallback { width: 26px; height: 26px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; color: #fff; }
+.btn-signout { font-size: 11px; color: var(--text-dim); text-decoration: none; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; transition: all .15s; }
+.btn-signout:hover { border-color: var(--red); color: var(--red); }
+
+.kanban { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 24px; min-height: calc(100vh - 80px); align-items: start; }
+.kanban-column { background: var(--surface); border-radius: var(--radius); border: 1px solid var(--border); }
+.kanban-column[data-status="todo"] { border-top: 3px solid var(--blue); }
+.kanban-column[data-status="in_progress"] { border-top: 3px solid var(--yellow); }
+.kanban-column[data-status="review"] { border-top: 3px solid #a855f7; }
+.kanban-column[data-status="done"] { border-top: 3px solid var(--green); }
+
+.column-header { padding: 16px; display: flex; align-items: center; justify-content: space-between; }
+.column-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; display: flex; align-items: center; gap: 8px; }
+.column-count { background: var(--surface2); padding: 2px 8px; border-radius: 10px; font-size: 12px; color: var(--text-dim); }
+.column-body { padding: 0 12px 12px; }
+
+.task-card { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; margin-bottom: 8px; }
+.task-card-title { font-size: 13px; font-weight: 500; margin-bottom: 8px; line-height: 1.4; }
+.task-card-meta { display: flex; align-items: center; justify-content: space-between; }
+.task-card-assignee { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+.avatar { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; color: #fff; flex-shrink: 0; }
+.task-priority { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 3px; text-transform: uppercase; }
+.task-priority.urgent { background: rgba(239,68,68,.2); color: var(--red); }
+.task-priority.high { background: rgba(234,179,8,.2); color: var(--yellow); }
+.task-priority.medium { background: rgba(99,102,241,.2); color: var(--accent); }
+.task-priority.low { background: rgba(107,114,128,.2); color: var(--text-dim); }
+
+@media (max-width: 1024px) { .kanban { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 600px) { .kanban { grid-template-columns: 1fr; } }
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="header-left">
+    <div class="logo">WC</div>
+    <h1>Winning Circle</h1>
+    <span class="badge readonly">Read Only</span>
+  </div>
+  <div class="header-right">
+    <span class="auto-refresh">Auto-refreshes every 30s</span>
+    <div class="user-info" id="userInfo" style="display:none">
+      <img id="boardUserAvatar" alt="">
+      <span id="boardUserName"></span>
+    </div>
+    <a href="/auth/logout" class="btn-signout">Sign out</a>
+  </div>
+</div>
+
+<div class="kanban" id="kanban"></div>
+
+<script>
+const statuses = ['todo','in_progress','review','done'];
+const statusLabels = { todo:'To Do', in_progress:'In Progress', review:'Review', done:'Done' };
+const statusColors = { todo:'var(--blue)', in_progress:'var(--yellow)', review:'#a855f7', done:'var(--green)' };
+
+async function loadBoard() {
+  const res = await fetch('/api/tasks');
+  const tasks = await res.json();
+  const board = document.getElementById('kanban');
+  board.innerHTML = statuses.map(s => {
+    const filtered = tasks.filter(t => t.status === s);
+    return `
+      <div class="kanban-column" data-status="${s}">
+        <div class="column-header">
+          <div class="column-title" style="color:${statusColors[s]}">
+            ${statusLabels[s]} <span class="column-count">${filtered.length}</span>
+          </div>
+        </div>
+        <div class="column-body">
+          ${filtered.map(t => {
+            const initials = t.member_name ? t.member_name.split(' ').map(n=>n[0]).join('') : '?';
+            return `<div class="task-card">
+              <div class="task-card-title">${esc(t.title)}</div>
+              <div class="task-card-meta">
+                <div class="task-card-assignee">
+                  <span class="avatar" style="background:${t.avatar_color||'#6366f1'}">${initials}</span>
+                  ${esc(t.member_name||'Unassigned')}
+                </div>
+                <span class="task-priority ${t.priority}">${t.priority}</span>
+              </div>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function esc(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+
+// Auth guard + user display
+fetch('/api/me')
+  .then(r => { if (!r.ok) window.location.href = '/login'; return r.json(); })
+  .then(me => {
+    if (!me || me.error) { window.location.href = '/login'; return; }
+    document.getElementById('boardUserName').textContent = me.name?.split(' ')[0] || me.email;
+    if (me.picture) document.getElementById('boardUserAvatar').src = me.picture;
+    document.getElementById('userInfo').style.display = 'flex';
+  })
+  .catch(() => window.location.href = '/login');
+
+loadBoard();
+setInterval(loadBoard, 30000);
+</script>
+</body>
+</html>

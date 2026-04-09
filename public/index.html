@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Winning Circle — Task Dashboard</title>
+<style>
+/* ───────── Reset & Variables ───────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1117; --surface: #1a1d27; --surface2: #242836;
+  --border: #2e3348; --text: #e4e7f1; --text-dim: #8b8fa7;
+  --accent: #6366f1; --accent-glow: rgba(99,102,241,.25);
+  --green: #22c55e; --yellow: #eab308; --red: #ef4444; --blue: #3b82f6;
+  --todo-bg: #1e2235; --progress-bg: #1e2a35; --review-bg: #2a2535; --done-bg: #1e2e25;
+  --radius: 10px; --radius-sm: 6px;
+}
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+button { cursor: pointer; font-family: inherit; }
+input, textarea, select { font-family: inherit; }
+
+/* ───────── Layout ───────── */
+.app { display: flex; min-height: 100vh; }
+.sidebar { width: 260px; background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; left: 0; bottom: 0; z-index: 100; transition: transform .3s; }
+.sidebar.collapsed { transform: translateX(-260px); }
+.main { flex: 1; margin-left: 260px; transition: margin-left .3s; }
+.main.expanded { margin-left: 0; }
+
+/* ───────── Sidebar ───────── */
+.sidebar-header { padding: 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+.sidebar-header .logo { width: 36px; height: 36px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; }
+.sidebar-header h1 { font-size: 16px; font-weight: 600; }
+.sidebar-header h1 span { display: block; font-size: 11px; color: var(--text-dim); font-weight: 400; }
+.sidebar-nav { flex: 1; padding: 12px; }
+.nav-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: var(--radius-sm); color: var(--text-dim); font-size: 14px; cursor: pointer; transition: all .15s; border: none; background: none; width: 100%; text-align: left; }
+.nav-item:hover { background: var(--surface2); color: var(--text); }
+.nav-item.active { background: var(--accent); color: #fff; }
+.nav-item svg { width: 18px; height: 18px; flex-shrink: 0; }
+.nav-section { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); padding: 16px 12px 6px; }
+
+/* ───────── Topbar ───────── */
+.topbar { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--border); background: var(--surface); position: sticky; top: 0; z-index: 50; }
+.topbar-left { display: flex; align-items: center; gap: 12px; }
+.hamburger { display: none; background: none; border: none; color: var(--text); padding: 4px; }
+.topbar h2 { font-size: 18px; font-weight: 600; }
+.topbar-actions { display: flex; gap: 8px; }
+
+/* ───────── Buttons ───────── */
+.btn { padding: 8px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface2); color: var(--text); font-size: 13px; font-weight: 500; transition: all .15s; display: inline-flex; align-items: center; gap: 6px; }
+.btn:hover { border-color: var(--accent); }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-primary:hover { background: #5558e6; }
+.btn-sm { padding: 5px 10px; font-size: 12px; }
+.btn-icon { padding: 6px; border-radius: var(--radius-sm); background: none; border: 1px solid transparent; color: var(--text-dim); }
+.btn-icon:hover { background: var(--surface2); color: var(--text); }
+
+/* ───────── Kanban Board ───────── */
+.kanban { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; padding: 24px; min-height: calc(100vh - 65px); align-items: start; }
+.kanban-column { background: var(--surface); border-radius: var(--radius); border: 1px solid var(--border); min-height: 300px; display: flex; flex-direction: column; }
+.kanban-column[data-status="todo"] { border-top: 3px solid var(--blue); }
+.kanban-column[data-status="in_progress"] { border-top: 3px solid var(--yellow); }
+.kanban-column[data-status="review"] { border-top: 3px solid #a855f7; }
+.kanban-column[data-status="done"] { border-top: 3px solid var(--green); }
+
+.column-header { padding: 16px; display: flex; align-items: center; justify-content: space-between; }
+.column-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; display: flex; align-items: center; gap: 8px; }
+.column-count { background: var(--surface2); padding: 2px 8px; border-radius: 10px; font-size: 12px; color: var(--text-dim); }
+.column-body { padding: 0 12px 12px; flex: 1; min-height: 100px; }
+
+/* ───────── Task Card ───────── */
+.task-card { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px; margin-bottom: 8px; cursor: grab; transition: all .15s; position: relative; }
+.task-card:hover { border-color: var(--accent); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,.3); }
+.task-card.dragging { opacity: .5; transform: rotate(2deg); }
+.task-card-title { font-size: 13px; font-weight: 500; margin-bottom: 8px; line-height: 1.4; }
+.task-card-meta { display: flex; align-items: center; justify-content: space-between; }
+.task-card-assignee { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+.task-card-assignee .avatar { width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; color: #fff; flex-shrink: 0; }
+.task-priority { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 3px; text-transform: uppercase; }
+.task-priority.urgent { background: rgba(239,68,68,.2); color: var(--red); }
+.task-priority.high { background: rgba(234,179,8,.2); color: var(--yellow); }
+.task-priority.medium { background: rgba(99,102,241,.2); color: var(--accent); }
+.task-priority.low { background: rgba(107,114,128,.2); color: var(--text-dim); }
+.task-card-actions { position: absolute; top: 8px; right: 8px; display: none; gap: 2px; }
+.task-card:hover .task-card-actions { display: flex; }
+.task-due { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
+.task-due.overdue { color: var(--red); }
+
+/* ───────── Drop Zone ───────── */
+.drop-zone { border: 2px dashed var(--border); border-radius: var(--radius-sm); padding: 20px; text-align: center; color: var(--text-dim); font-size: 12px; transition: all .15s; }
+.drop-zone.drag-over { border-color: var(--accent); background: var(--accent-glow); }
+
+/* ───────── Modal ───────── */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 200; display: flex; align-items: center; justify-content: center; opacity: 0; visibility: hidden; transition: all .2s; }
+.modal-overlay.show { opacity: 1; visibility: visible; }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); width: 480px; max-width: 90vw; max-height: 90vh; overflow-y: auto; }
+.modal-header { padding: 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+.modal-header h3 { font-size: 16px; }
+.modal-body { padding: 20px; }
+.modal-footer { padding: 16px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+
+/* ───────── Form ───────── */
+.form-group { margin-bottom: 16px; }
+.form-group label { display: block; font-size: 12px; font-weight: 500; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase; letter-spacing: .04em; }
+.form-group input, .form-group textarea, .form-group select {
+  width: 100%; padding: 10px 12px; background: var(--surface2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text); font-size: 14px; outline: none; transition: border-color .15s;
+}
+.form-group input:focus, .form-group textarea:focus, .form-group select:focus { border-color: var(--accent); }
+.form-group textarea { min-height: 80px; resize: vertical; }
+
+/* ───────── Stats Cards ───────── */
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; padding: 24px; }
+.stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; }
+.stat-card .stat-value { font-size: 32px; font-weight: 700; }
+.stat-card .stat-label { font-size: 13px; color: var(--text-dim); margin-top: 4px; }
+.stat-card.accent .stat-value { color: var(--accent); }
+.stat-card.green .stat-value { color: var(--green); }
+.stat-card.yellow .stat-value { color: var(--yellow); }
+.stat-card.blue .stat-value { color: var(--blue); }
+
+/* ───────── Team View ───────── */
+.team-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; padding: 24px; }
+.member-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; transition: border-color .15s; }
+.member-card:hover { border-color: var(--accent); }
+.member-card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.member-card-header .avatar { width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: 600; color: #fff; font-size: 16px; }
+.member-card-header h4 { font-size: 15px; }
+.member-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.member-stat { text-align: center; padding: 8px; background: var(--surface2); border-radius: var(--radius-sm); }
+.member-stat .num { font-size: 18px; font-weight: 700; }
+.member-stat .lbl { font-size: 10px; color: var(--text-dim); text-transform: uppercase; }
+
+/* ───────── Activity Feed ───────── */
+.activity-feed { padding: 24px; max-width: 700px; }
+.activity-item { display: flex; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.activity-item .avatar { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; color: #fff; flex-shrink: 0; }
+.activity-item .activity-content { flex: 1; }
+.activity-item .activity-content strong { color: var(--text); }
+.activity-item .activity-content p { font-size: 13px; color: var(--text-dim); line-height: 1.4; }
+.activity-item .activity-time { font-size: 11px; color: var(--text-dim); white-space: nowrap; }
+
+/* ───────── Daily Updates ───────── */
+.daily-updates-container { padding: 24px; }
+.daily-update-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 12px; }
+.daily-update-card h4 { margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+.update-section { margin-bottom: 10px; }
+.update-section .update-label { font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--text-dim); margin-bottom: 4px; }
+.update-section p { font-size: 14px; line-height: 1.5; }
+.update-section.blockers p { color: var(--red); }
+
+/* ───────── Responsive ───────── */
+@media (max-width: 1024px) {
+  .kanban { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 768px) {
+  .sidebar { transform: translateX(-260px); }
+  .sidebar.open { transform: translateX(0); }
+  .main { margin-left: 0; }
+  .hamburger { display: block; }
+  .kanban { grid-template-columns: 1fr; }
+}
+
+/* ───────── Scrollbar ───────── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* ───────── User / Auth ───────── */
+.user-menu { display: flex; align-items: center; gap: 10px; }
+.user-avatar { width: 32px; height: 32px; border-radius: 50%; border: 2px solid var(--border); object-fit: cover; }
+.user-avatar-fallback { width: 32px; height: 32px; border-radius: 50%; background: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 600; color: #fff; border: 2px solid var(--border); }
+.user-name { font-size: 13px; color: var(--text-dim); max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btn-logout { padding: 6px 12px; font-size: 12px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: transparent; color: var(--text-dim); cursor: pointer; font-family: inherit; transition: all .15s; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+.btn-logout:hover { border-color: var(--red); color: var(--red); background: rgba(239,68,68,.08); }
+
+/* ───────── Filter bar ───────── */
+.filter-bar { display: flex; gap: 8px; align-items: center; }
+.filter-bar select { padding: 6px 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-size: 13px; }
+
+/* ───────── Toast ───────── */
+.toast-container { position: fixed; bottom: 24px; right: 24px; z-index: 300; display: flex; flex-direction: column; gap: 8px; }
+.toast { padding: 12px 16px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,.4); animation: slideIn .3s ease; display: flex; align-items: center; gap: 8px; }
+.toast.success { border-left: 3px solid var(--green); }
+.toast.error { border-left: 3px solid var(--red); }
+@keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+</style>
+</head>
+<body>
+
+<div class="app" id="app">
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">WC</div>
+      <h1>Winning Circle <span>Task Dashboard</span></h1>
+    </div>
+    <nav class="sidebar-nav">
+      <div class="nav-section">Main</div>
+      <button class="nav-item active" data-view="kanban" onclick="switchView('kanban')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+        Kanban Board
+      </button>
+      <button class="nav-item" data-view="overview" onclick="switchView('overview')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>
+        Overview
+      </button>
+      <button class="nav-item" data-view="team" onclick="switchView('team')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        Team
+      </button>
+      <button class="nav-item" data-view="activity" onclick="switchView('activity')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        Activity
+      </button>
+      <button class="nav-item" data-view="daily" onclick="switchView('daily')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+        Daily Updates
+      </button>
+
+      <div class="nav-section">Manage</div>
+      <button class="nav-item" onclick="openMemberModal()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+        Add Member
+      </button>
+    </nav>
+  </aside>
+
+  <!-- Main Content -->
+  <div class="main" id="mainContent">
+    <!-- Topbar -->
+    <div class="topbar">
+      <div class="topbar-left">
+        <button class="hamburger btn-icon" onclick="toggleSidebar()">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+        <h2 id="viewTitle">Kanban Board</h2>
+      </div>
+      <div class="topbar-actions">
+        <div class="filter-bar" id="filterBar">
+          <select id="memberFilter" onchange="applyFilters()">
+            <option value="">All Members</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" onclick="openTaskModal()">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          New Task
+        </button>
+        <div class="user-menu" id="userMenu" style="display:none">
+          <span class="user-name" id="userName"></span>
+          <div class="user-avatar-fallback" id="userAvatarFallback" style="display:none"></div>
+          <img class="user-avatar" id="userAvatar" alt="You" style="display:none" onerror="this.style.display='none';document.getElementById('userAvatarFallback').style.display='flex'">
+          <a href="/auth/logout" class="btn-logout">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+            Sign out
+          </a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Views -->
+    <div id="kanbanView" class="view">
+      <div class="kanban" id="kanbanBoard">
+        <div class="kanban-column" data-status="todo">
+          <div class="column-header">
+            <div class="column-title" style="color:var(--blue)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/></svg>
+              To Do <span class="column-count" id="count-todo">0</span>
+            </div>
+          </div>
+          <div class="column-body" id="col-todo" ondrop="handleDrop(event,'todo')" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)"></div>
+        </div>
+        <div class="kanban-column" data-status="in_progress">
+          <div class="column-header">
+            <div class="column-title" style="color:var(--yellow)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              In Progress <span class="column-count" id="count-in_progress">0</span>
+            </div>
+          </div>
+          <div class="column-body" id="col-in_progress" ondrop="handleDrop(event,'in_progress')" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)"></div>
+        </div>
+        <div class="kanban-column" data-status="review">
+          <div class="column-header">
+            <div class="column-title" style="color:#a855f7">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              Review <span class="column-count" id="count-review">0</span>
+            </div>
+          </div>
+          <div class="column-body" id="col-review" ondrop="handleDrop(event,'review')" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)"></div>
+        </div>
+        <div class="kanban-column" data-status="done">
+          <div class="column-header">
+            <div class="column-title" style="color:var(--green)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+              Done <span class="column-count" id="count-done">0</span>
+            </div>
+          </div>
+          <div class="column-body" id="col-done" ondrop="handleDrop(event,'done')" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="overviewView" class="view" style="display:none"></div>
+    <div id="teamView" class="view" style="display:none"></div>
+    <div id="activityView" class="view" style="display:none"></div>
+    <div id="dailyView" class="view" style="display:none"></div>
+  </div>
+</div>
+
+<!-- Task Modal -->
+<div class="modal-overlay" id="taskModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="taskModalTitle">New Task</h3>
+      <button class="btn-icon" onclick="closeModal('taskModal')">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="taskId">
+      <div class="form-group">
+        <label>Title</label>
+        <input type="text" id="taskTitle" placeholder="What needs to be done?">
+      </div>
+      <div class="form-group">
+        <label>Description</label>
+        <textarea id="taskDesc" placeholder="Add details..."></textarea>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="form-group">
+          <label>Assign To</label>
+          <select id="taskMember"><option value="">Unassigned</option></select>
+        </div>
+        <div class="form-group">
+          <label>Priority</label>
+          <select id="taskPriority">
+            <option value="low">Low</option>
+            <option value="medium" selected>Medium</option>
+            <option value="high">High</option>
+            <option value="urgent">Urgent</option>
+          </select>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+        <div class="form-group">
+          <label>Status</label>
+          <select id="taskStatus">
+            <option value="todo">To Do</option>
+            <option value="in_progress">In Progress</option>
+            <option value="review">Review</option>
+            <option value="done">Done</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Due Date</label>
+          <input type="date" id="taskDue">
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('taskModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveTask()">Save Task</button>
+    </div>
+  </div>
+</div>
+
+<!-- Member Modal -->
+<div class="modal-overlay" id="memberModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>Add Team Member</h3>
+      <button class="btn-icon" onclick="closeModal('memberModal')">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>Name</label>
+        <input type="text" id="memberName" placeholder="Full name">
+      </div>
+      <div class="form-group">
+        <label>Slack User ID (optional)</label>
+        <input type="text" id="memberSlackId" placeholder="e.g., U01ABC23DEF">
+      </div>
+      <div class="form-group">
+        <label>Color</label>
+        <input type="color" id="memberColor" value="#6366f1" style="height:40px">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('memberModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveMember()">Add Member</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast-container" id="toasts"></div>
+
+<script>
+// ─────────── State ───────────
+const API = '';  // relative to same origin
+let tasks = [];
+let members = [];
+let currentView = 'kanban';
+let currentFilter = '';
+let draggedTaskId = null;
+
+// ─────────── Init ───────────
+async function init() {
+  // Auth guard — redirect to login if not authenticated
+  try {
+    const me = await api('/api/me');
+    if (!me || me.error) { window.location.href = '/login'; return; }
+    // Show user info in topbar
+    document.getElementById('userName').textContent = me.name?.split(' ')[0] || me.email;
+    if (me.picture) {
+      document.getElementById('userAvatar').src = me.picture;
+      document.getElementById('userAvatar').style.display = 'block';
+    } else {
+      const initials = (me.name || me.email).split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase();
+      document.getElementById('userAvatarFallback').textContent = initials;
+      document.getElementById('userAvatarFallback').style.display = 'flex';
+    }
+    document.getElementById('userMenu').style.display = 'flex';
+  } catch {
+    window.location.href = '/login';
+    return;
+  }
+
+  await Promise.all([loadMembers(), loadTasks()]);
+  renderKanban();
+}
+
+// ─────────── API helpers ───────────
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+    body: opts.body ? JSON.stringify(opts.body) : undefined
+  });
+  return res.json();
+}
+
+async function loadMembers() {
+  members = await api('/api/members');
+  populateMemberDropdowns();
+}
+
+async function loadTasks() {
+  let url = '/api/tasks';
+  if (currentFilter) url += `?member_id=${currentFilter}`;
+  tasks = await api(url);
+}
+
+// ─────────── Render Kanban ───────────
+function renderKanban() {
+  const statuses = ['todo', 'in_progress', 'review', 'done'];
+  statuses.forEach(s => {
+    const col = document.getElementById(`col-${s}`);
+    const filtered = tasks.filter(t => t.status === s);
+    document.getElementById(`count-${s}`).textContent = filtered.length;
+    col.innerHTML = filtered.map(t => taskCardHTML(t)).join('') +
+      '<div class="drop-zone" style="display:none">Drop here</div>';
+  });
+}
+
+function taskCardHTML(t) {
+  const initials = t.member_name ? t.member_name.split(' ').map(n=>n[0]).join('') : '?';
+  const color = t.avatar_color || '#6366f1';
+  const dueHTML = t.due_date ? `<div class="task-due ${new Date(t.due_date)<new Date()?'overdue':''}">${t.due_date}</div>` : '';
+  return `
+    <div class="task-card" draggable="true" data-id="${t.id}"
+      ondragstart="handleDragStart(event,${t.id})" ondragend="handleDragEnd(event)">
+      <div class="task-card-actions">
+        <button class="btn-icon btn-sm" onclick="openEditTask(${t.id})" title="Edit">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        </button>
+        <button class="btn-icon btn-sm" onclick="deleteTask(${t.id})" title="Delete">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
+      </div>
+      <div class="task-card-title">${escapeHtml(t.title)}</div>
+      <div class="task-card-meta">
+        <div class="task-card-assignee">
+          <span class="avatar" style="background:${color}">${initials}</span>
+          ${t.member_name || 'Unassigned'}
+        </div>
+        <span class="task-priority ${t.priority}">${t.priority}</span>
+      </div>
+      ${dueHTML}
+    </div>`;
+}
+
+// ─────────── Drag & Drop ───────────
+function handleDragStart(e, id) {
+  draggedTaskId = id;
+  e.target.classList.add('dragging');
+  e.dataTransfer.effectAllowed = 'move';
+}
+function handleDragEnd(e) {
+  e.target.classList.remove('dragging');
+  document.querySelectorAll('.drop-zone').forEach(z => z.style.display = 'none');
+  document.querySelectorAll('.column-body').forEach(c => c.classList.remove('drag-over'));
+}
+function handleDragOver(e) {
+  e.preventDefault();
+  e.currentTarget.classList.add('drag-over');
+}
+function handleDragLeave(e) {
+  e.currentTarget.classList.remove('drag-over');
+}
+async function handleDrop(e, status) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('drag-over');
+  if (!draggedTaskId) return;
+  await api(`/api/tasks/${draggedTaskId}`, { method: 'PUT', body: { status } });
+  await loadTasks();
+  renderKanban();
+  toast(`Task moved to ${statusLabel(status)}`, 'success');
+  draggedTaskId = null;
+}
+
+// ─────────── Task CRUD ───────────
+function openTaskModal() {
+  document.getElementById('taskId').value = '';
+  document.getElementById('taskTitle').value = '';
+  document.getElementById('taskDesc').value = '';
+  document.getElementById('taskMember').value = '';
+  document.getElementById('taskPriority').value = 'medium';
+  document.getElementById('taskStatus').value = 'todo';
+  document.getElementById('taskDue').value = '';
+  document.getElementById('taskModalTitle').textContent = 'New Task';
+  openModal('taskModal');
+}
+
+function openEditTask(id) {
+  const t = tasks.find(x => x.id === id);
+  if (!t) return;
+  document.getElementById('taskId').value = t.id;
+  document.getElementById('taskTitle').value = t.title;
+  document.getElementById('taskDesc').value = t.description;
+  document.getElementById('taskMember').value = t.member_id || '';
+  document.getElementById('taskPriority').value = t.priority;
+  document.getElementById('taskStatus').value = t.status;
+  document.getElementById('taskDue').value = t.due_date || '';
+  document.getElementById('taskModalTitle').textContent = 'Edit Task';
+  openModal('taskModal');
+}
+
+async function saveTask() {
+  const id = document.getElementById('taskId').value;
+  const body = {
+    title: document.getElementById('taskTitle').value.trim(),
+    description: document.getElementById('taskDesc').value.trim(),
+    member_id: document.getElementById('taskMember').value || null,
+    priority: document.getElementById('taskPriority').value,
+    status: document.getElementById('taskStatus').value,
+    due_date: document.getElementById('taskDue').value || null
+  };
+  if (!body.title) return toast('Title is required', 'error');
+  if (id) {
+    await api(`/api/tasks/${id}`, { method: 'PUT', body });
+    toast('Task updated', 'success');
+  } else {
+    await api('/api/tasks', { method: 'POST', body });
+    toast('Task created', 'success');
+  }
+  closeModal('taskModal');
+  await loadTasks();
+  renderCurrentView();
+}
+
+async function deleteTask(id) {
+  if (!confirm('Delete this task?')) return;
+  await api(`/api/tasks/${id}`, { method: 'DELETE' });
+  await loadTasks();
+  renderCurrentView();
+  toast('Task deleted', 'success');
+}
+
+// ─────────── Member CRUD ───────────
+function openMemberModal() { openModal('memberModal'); }
+
+async function saveMember() {
+  const name = document.getElementById('memberName').value.trim();
+  if (!name) return toast('Name is required', 'error');
+  await api('/api/members', {
+    method: 'POST',
+    body: {
+      name,
+      slack_id: document.getElementById('memberSlackId').value.trim(),
+      avatar_color: document.getElementById('memberColor').value
+    }
+  });
+  document.getElementById('memberName').value = '';
+  document.getElementById('memberSlackId').value = '';
+  closeModal('memberModal');
+  await loadMembers();
+  toast(`${name} added to team`, 'success');
+}
+
+// ─────────── Views ───────────
+function switchView(view) {
+  currentView = view;
+  document.querySelectorAll('.view').forEach(v => v.style.display = 'none');
+  document.getElementById(view + 'View').style.display = '';
+  document.querySelectorAll('.nav-item[data-view]').forEach(n => n.classList.remove('active'));
+  document.querySelector(`.nav-item[data-view="${view}"]`)?.classList.add('active');
+  const titles = { kanban:'Kanban Board', overview:'Overview', team:'Team', activity:'Activity', daily:'Daily Updates' };
+  document.getElementById('viewTitle').textContent = titles[view] || '';
+  document.getElementById('filterBar').style.display = view === 'kanban' ? 'flex' : 'none';
+  renderCurrentView();
+  // close sidebar on mobile
+  if (window.innerWidth < 768) document.getElementById('sidebar').classList.remove('open');
+}
+
+async function renderCurrentView() {
+  switch (currentView) {
+    case 'kanban': renderKanban(); break;
+    case 'overview': await renderOverview(); break;
+    case 'team': await renderTeam(); break;
+    case 'activity': await renderActivity(); break;
+    case 'daily': await renderDaily(); break;
+  }
+}
+
+async function renderOverview() {
+  const stats = await api('/api/stats');
+  const statusMap = {};
+  stats.tasksByStatus.forEach(s => statusMap[s.status] = s.count);
+  const total = Object.values(statusMap).reduce((a,b)=>a+b, 0);
+  document.getElementById('overviewView').innerHTML = `
+    <div class="stats-grid">
+      <div class="stat-card blue"><div class="stat-value">${total}</div><div class="stat-label">Total Tasks</div></div>
+      <div class="stat-card yellow"><div class="stat-value">${statusMap.in_progress||0}</div><div class="stat-label">In Progress</div></div>
+      <div class="stat-card accent"><div class="stat-value">${statusMap.review||0}</div><div class="stat-label">In Review</div></div>
+      <div class="stat-card green"><div class="stat-value">${stats.completedToday}</div><div class="stat-label">Completed Today</div></div>
+    </div>
+    <div class="team-grid" style="padding-top:0">
+      ${stats.tasksByMember.map(m => `
+        <div class="member-card">
+          <div class="member-card-header">
+            <span class="avatar" style="background:${m.avatar_color}">${m.name.split(' ').map(n=>n[0]).join('')}</span>
+            <h4>${escapeHtml(m.name)}</h4>
+          </div>
+          <div class="member-stats">
+            <div class="member-stat"><div class="num" style="color:var(--blue)">${m.todo||0}</div><div class="lbl">To Do</div></div>
+            <div class="member-stat"><div class="num" style="color:var(--yellow)">${m.in_progress||0}</div><div class="lbl">Active</div></div>
+            <div class="member-stat"><div class="num" style="color:#a855f7">${m.review||0}</div><div class="lbl">Review</div></div>
+            <div class="member-stat"><div class="num" style="color:var(--green)">${m.done||0}</div><div class="lbl">Done</div></div>
+          </div>
+        </div>
+      `).join('')}
+    </div>`;
+}
+
+async function renderTeam() {
+  const stats = await api('/api/stats');
+  document.getElementById('teamView').innerHTML = `
+    <div class="team-grid">
+      ${members.map(m => {
+        const ms = stats.tasksByMember.find(x=>x.name===m.name) || {};
+        return `
+        <div class="member-card">
+          <div class="member-card-header">
+            <span class="avatar" style="background:${m.avatar_color}">${m.name.split(' ').map(n=>n[0]).join('')}</span>
+            <div>
+              <h4>${escapeHtml(m.name)}</h4>
+              <div style="font-size:11px;color:var(--text-dim)">${m.slack_id ? 'Slack connected' : 'No Slack ID'}</div>
+            </div>
+          </div>
+          <div class="member-stats">
+            <div class="member-stat"><div class="num" style="color:var(--blue)">${ms.todo||0}</div><div class="lbl">To Do</div></div>
+            <div class="member-stat"><div class="num" style="color:var(--yellow)">${ms.in_progress||0}</div><div class="lbl">Active</div></div>
+            <div class="member-stat"><div class="num" style="color:#a855f7">${ms.review||0}</div><div class="lbl">Review</div></div>
+            <div class="member-stat"><div class="num" style="color:var(--green)">${ms.done||0}</div><div class="lbl">Done</div></div>
+          </div>
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
+async function renderActivity() {
+  const activities = await api('/api/activity');
+  document.getElementById('activityView').innerHTML = `
+    <div class="activity-feed">
+      <h3 style="margin-bottom:16px">Recent Activity</h3>
+      ${activities.length ? activities.map(a => `
+        <div class="activity-item">
+          <span class="avatar" style="background:${a.avatar_color||'#6366f1'}">${(a.member_name||'?').split(' ').map(n=>n[0]).join('')}</span>
+          <div class="activity-content">
+            <p><strong>${escapeHtml(a.member_name||'System')}</strong> ${escapeHtml(a.action)} — ${escapeHtml(a.task_title||'')}</p>
+            <p>${escapeHtml(a.details||'')}</p>
+          </div>
+          <span class="activity-time">${timeAgo(a.created_at)}</span>
+        </div>
+      `).join('') : '<p style="color:var(--text-dim)">No activity yet</p>'}
+    </div>`;
+}
+
+async function renderDaily() {
+  const updates = await api('/api/daily-updates');
+  document.getElementById('dailyView').innerHTML = `
+    <div class="daily-updates-container">
+      <h3 style="margin-bottom:16px">Today's Updates</h3>
+      ${updates.length ? updates.map(u => `
+        <div class="daily-update-card">
+          <h4>
+            <span class="avatar" style="background:${u.avatar_color};width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:#fff">${u.member_name.split(' ').map(n=>n[0]).join('')}</span>
+            ${escapeHtml(u.member_name)}
+          </h4>
+          ${u.done_summary ? `<div class="update-section"><div class="update-label">Done</div><p>${escapeHtml(u.done_summary)}</p></div>` : ''}
+          ${u.working_on_summary ? `<div class="update-section"><div class="update-label">Working On</div><p>${escapeHtml(u.working_on_summary)}</p></div>` : ''}
+          ${u.blockers ? `<div class="update-section blockers"><div class="update-label">Blockers</div><p>${escapeHtml(u.blockers)}</p></div>` : ''}
+        </div>
+      `).join('') : '<p style="color:var(--text-dim)">No updates submitted today. Reminders go out via Slack!</p>'}
+    </div>`;
+}
+
+// ─────────── Utilities ───────────
+function populateMemberDropdowns() {
+  const opts = members.map(m => `<option value="${m.id}">${escapeHtml(m.name)}</option>`).join('');
+  document.getElementById('taskMember').innerHTML = '<option value="">Unassigned</option>' + opts;
+  document.getElementById('memberFilter').innerHTML = '<option value="">All Members</option>' + opts;
+}
+function applyFilters() {
+  currentFilter = document.getElementById('memberFilter').value;
+  loadTasks().then(() => renderKanban());
+}
+function statusLabel(s) { return { todo:'To Do', in_progress:'In Progress', review:'Review', done:'Done' }[s] || s; }
+function escapeHtml(s) { const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
+function timeAgo(dt) {
+  const diff = (Date.now()-new Date(dt+'Z'))/1000;
+  if (diff<60) return 'just now';
+  if (diff<3600) return Math.floor(diff/60)+'m ago';
+  if (diff<86400) return Math.floor(diff/3600)+'h ago';
+  return Math.floor(diff/86400)+'d ago';
+}
+function openModal(id) { document.getElementById(id).classList.add('show'); }
+function closeModal(id) { document.getElementById(id).classList.remove('show'); }
+function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
+function toast(msg, type='success') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+// ─────────── Boot ───────────
+init();
+</script>
+</body>
+</html>
