@@ -276,7 +276,9 @@ app.delete('/api/tasks/:id', async (req, res) => {
   const db = getDB();
   const task = await db.get('SELECT * FROM tasks WHERE id = ?', [parseInt(req.params.id)]);
   if (!task) return res.status(404).json({ error: 'Task not found' });
-  if (task.member_id !== req.user.member_id) {
+  // Allow deleting your own tasks OR orphaned tasks (member was deleted)
+  const taskOwner = await db.get('SELECT * FROM members WHERE id = ?', [task.member_id]);
+  if (task.member_id !== req.user.member_id && taskOwner) {
     return res.status(403).json({ error: 'You can only delete your own tasks.' });
   }
   await db.run('DELETE FROM tasks WHERE id = ?', [parseInt(req.params.id)]);

@@ -430,7 +430,12 @@ async function api(path, opts = {}) {
     ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined
   });
-  return res.json();
+  const data = await res.json();
+  if (!res.ok) {
+    toast(data.error || 'Something went wrong', 'error');
+    throw new Error(data.error);
+  }
+  return data;
 }
 
 async function loadMembers() {
@@ -549,24 +554,28 @@ async function saveTask() {
     due_date: document.getElementById('taskDue').value || null
   };
   if (!body.title) return toast('Title is required', 'error');
-  if (id) {
-    await api(`/api/tasks/${id}`, { method: 'PUT', body });
-    toast('Task updated', 'success');
-  } else {
-    await api('/api/tasks', { method: 'POST', body });
-    toast('Task created', 'success');
-  }
-  closeModal('taskModal');
-  await loadTasks();
-  renderCurrentView();
+  try {
+    if (id) {
+      await api(`/api/tasks/${id}`, { method: 'PUT', body });
+      toast('Task updated', 'success');
+    } else {
+      await api('/api/tasks', { method: 'POST', body });
+      toast('Task created', 'success');
+    }
+    closeModal('taskModal');
+    await loadTasks();
+    renderCurrentView();
+  } catch (e) { /* error already shown by api() */ }
 }
 
 async function deleteTask(id) {
   if (!confirm('Delete this task?')) return;
-  await api(`/api/tasks/${id}`, { method: 'DELETE' });
-  await loadTasks();
-  renderCurrentView();
-  toast('Task deleted', 'success');
+  try {
+    await api(`/api/tasks/${id}`, { method: 'DELETE' });
+    await loadTasks();
+    renderCurrentView();
+    toast('Task deleted', 'success');
+  } catch (e) { /* error already shown by api() */ }
 }
 
 // ─────────── Member CRUD ───────────
