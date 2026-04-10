@@ -121,8 +121,7 @@ fetch('/api/me')
   .then(r => { if (!r.ok) window.location.href = '/login'; return r.json(); })
   .then(me => {
     if (!me || me.error) { window.location.href = '/login'; return; }
-    document.getElementById('boardUserName').textContent = me.name?.split(' ')[0] || me.email;
-    if (me.picture) document.getElementById('boardUserAvatar').src = me.picture;
+    document.getElementById('boardUserName').textContent = me.name?.split(' ')[0] || '';
     document.getElementById('userInfo').style.display = 'flex';
   })
   .catch(() => window.location.href = '/login');

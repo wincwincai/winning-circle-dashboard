@@ -325,7 +325,7 @@ input, textarea, select { font-family: inherit; }
         <textarea id="taskDesc" placeholder="Add details..."></textarea>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-        <div class="form-group">
+        <div class="form-group" style="display:none">
           <label>Assign To</label>
           <select id="taskMember"><option value="">Unassigned</option></select>
         </div>
@@ -409,15 +409,10 @@ async function init() {
     const me = await api('/api/me');
     if (!me || me.error) { window.location.href = '/login'; return; }
     // Show user info in topbar
-    document.getElementById('userName').textContent = me.name?.split(' ')[0] || me.email;
-    if (me.picture) {
-      document.getElementById('userAvatar').src = me.picture;
-      document.getElementById('userAvatar').style.display = 'block';
-    } else {
-      const initials = (me.name || me.email).split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase();
-      document.getElementById('userAvatarFallback').textContent = initials;
-      document.getElementById('userAvatarFallback').style.display = 'flex';
-    }
+    document.getElementById('userName').textContent = me.name?.split(' ')[0] || '';
+    const initials = (me.name || '?').split(' ').map(n => n[0]).join('').slice(0, 2).toUpperCase();
+    document.getElementById('userAvatarFallback').textContent = initials;
+    document.getElementById('userAvatarFallback').style.display = 'flex';
     document.getElementById('userMenu').style.display = 'flex';
   } catch {
     window.location.href = '/login';
@@ -549,7 +544,6 @@ async function saveTask() {
   const body = {
     title: document.getElementById('taskTitle').value.trim(),
     description: document.getElementById('taskDesc').value.trim(),
-    member_id: document.getElementById('taskMember').value || null,
     priority: document.getElementById('taskPriority').value,
     status: document.getElementById('taskStatus').value,
     due_date: document.getElementById('taskDue').value || null

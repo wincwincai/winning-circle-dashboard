@@ -85,7 +85,7 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-app.post('/auth/login', loginLimiter, (req, res) => {
+app.post('/auth/login', loginLimiter, async (req, res) => {
   const { name, accessCode } = req.body;
   if (!name || !accessCode) {
     return res.status(400).json({ error: 'Name and Access Code are required.' });
@@ -95,9 +95,22 @@ app.post('/auth/login', loginLimiter, (req, res) => {
     return res.status(401).json({ error: 'Invalid access code.' });
   }
 
-  // Issue JWT
+  // Match to a team member (case-insensitive, Unicode-safe)
+  await initDatabase();
+  const db = getDB();
+  const allMembers = await db.all('SELECT * FROM members');
+  const trimmedName = name.trim();
+  const member = allMembers.find(m =>
+    m.name.localeCompare(trimmedName, undefined, { sensitivity: 'accent' }) === 0
+  );
+
+  if (!member) {
+    return res.status(403).json({ error: 'You are not a registered team member. Ask your admin to add you first.' });
+  }
+
+  // Issue JWT with member_id
   const token = jwt.sign(
-    { name: name.trim() },
+    { name: member.name, member_id: member.id },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -137,10 +150,13 @@ app.use('/api', requireAuth);
 // ---------------------------------------------------------------------------
 // API — Me (current user from JWT)
 // ---------------------------------------------------------------------------
-app.get('/api/me', (req, res) => {
+app.get('/api/me', async (req, res) => {
+  const db = getDB();
+  const member = await db.get('SELECT * FROM members WHERE id = ?', [req.user.member_id]);
   res.json({
     name: req.user.name,
-    email: `${req.user.name.split(' ')[0].toLowerCase()}@winningcircle.io` // Fallback for avatar matching
+    member_id: req.user.member_id,
+    avatar_color: member?.avatar_color || '#6366f1',
   });
 });
 
@@ -196,15 +212,17 @@ app.get('/api/tasks', async (req, res) => {
 
 app.post('/api/tasks', async (req, res) => {
   const db = getDB();
-  const { title, description, status, priority, member_id, due_date } = req.body;
+  const { title, description, status, priority, due_date } = req.body;
   if (!title) return res.status(400).json({ error: 'Title is required' });
+  // Always assign to the logged-in user
+  const memberId = req.user.member_id;
   const info = await db.run(
     'INSERT INTO tasks (title, description, status, priority, member_id, due_date) VALUES (?, ?, ?, ?, ?, ?)',
-    [title, description || '', status || 'todo', priority || 'medium', member_id || null, due_date || null]
+    [title, description || '', status || 'todo', priority || 'medium', memberId, due_date || null]
   );
   await db.run(
     'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
-    [info.lastInsertRowid, member_id || null, 'created', `Task "${title}" created`]
+    [info.lastInsertRowid, memberId, 'created', `Task "${title}" created`]
   );
   res.status(201).json(await db.get(
     'SELECT t.*, m.name as member_name, m.avatar_color FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE t.id = ?',
@@ -218,7 +236,12 @@ app.put('/api/tasks/:id', async (req, res) => {
   const existing = await db.get('SELECT * FROM tasks WHERE id = ?', [taskId]);
   if (!existing) return res.status(404).json({ error: 'Task not found' });
 
-  const { title, description, status, priority, member_id, due_date } = req.body;
+  // Ownership check: can only edit your own tasks
+  if (existing.member_id !== req.user.member_id) {
+    return res.status(403).json({ error: 'You can only edit your own tasks.' });
+  }
+
+  const { title, description, status, priority, due_date } = req.body;
   const newStatus = status || existing.status;
   const completedAt = newStatus === 'done' && existing.status !== 'done'
     ? new Date().toISOString() : existing.completed_at;
@@ -228,19 +251,18 @@ app.put('/api/tasks/:id', async (req, res) => {
     description = COALESCE(?, description),
     status = COALESCE(?, status),
     priority = COALESCE(?, priority),
-    member_id = COALESCE(?, member_id),
     due_date = COALESCE(?, due_date),
     completed_at = ?,
     updated_at = CURRENT_TIMESTAMP
     WHERE id = ?`,
     [title || null, description || null, status || null, priority || null,
-    member_id || null, due_date || null, completedAt, taskId]
+    due_date || null, completedAt, taskId]
   );
 
   if (status && status !== existing.status) {
     await db.run(
       'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
-      [taskId, member_id || existing.member_id, 'status_change', `Status: ${existing.status} → ${status}`]
+      [taskId, existing.member_id, 'status_change', `Status: ${existing.status} → ${status}`]
     );
   }
 
@@ -252,6 +274,11 @@ app.put('/api/tasks/:id', async (req, res) => {
 
 app.delete('/api/tasks/:id', async (req, res) => {
   const db = getDB();
+  const task = await db.get('SELECT * FROM tasks WHERE id = ?', [parseInt(req.params.id)]);
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  if (task.member_id !== req.user.member_id) {
+    return res.status(403).json({ error: 'You can only delete your own tasks.' });
+  }
   await db.run('DELETE FROM tasks WHERE id = ?', [parseInt(req.params.id)]);
   res.json({ success: true });
 });
@@ -300,11 +327,11 @@ app.get('/api/daily-updates', async (req, res) => {
 
 app.post('/api/daily-updates', async (req, res) => {
   const db = getDB();
-  const { member_id, done_summary, working_on_summary, blockers } = req.body;
+  const { done_summary, working_on_summary, blockers } = req.body;
   const date = new Date().toISOString().split('T')[0];
   await db.run(`INSERT OR REPLACE INTO daily_updates (member_id, date, done_summary, working_on_summary, blockers)
     VALUES (?, ?, ?, ?, ?)`,
-    [member_id, date, done_summary, working_on_summary, blockers]);
+    [req.user.member_id, date, done_summary, working_on_summary, blockers]);
   res.json({ success: true });
 });
 

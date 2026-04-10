@@ -1,15 +1,13 @@
 /**
  * Slack Bot Integration for Winning Circle Dashboard
  *
- * Features:
- * - Daily standup reminders (configurable time via CRON)
- * - Interactive task status updates via Slack
- * - DM the bot to manage tasks conversationally
- * - Team members can view, update, and create tasks from Slack
- * - Daily summary posts to a channel
+ * AI-powered task management agent using Gemini.
+ * Team members DM the bot naturally and Gemini handles everything
+ * via tool use — creating, updating, listing, and managing tasks.
  */
 
 const { App, ExpressReceiver } = require('@slack/bolt');
+const { GoogleGenAI } = require('@google/genai');
 const cron = require('node-cron');
 
 function initSlackBot(expressApp, db) {
@@ -27,9 +25,276 @@ function initSlackBot(expressApp, db) {
   const CHANNEL_ID = process.env.SLACK_CHANNEL_ID || '';
   const REMINDER_CRON = process.env.REMINDER_CRON || '0 9 * * 1-5';
 
-  // ─────────── DM Handler — Natural task management ───────────
+  // ─────────── Gemini AI Agent ───────────
+  const genai = process.env.GEMINI_API_KEY
+    ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+    : null;
+
+  const TOOLS_DECLARATION = [{
+    functionDeclarations: [
+      {
+        name: 'list_tasks',
+        description: 'List tasks for the current user. Returns active tasks by default, or filter by status.',
+        parameters: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', enum: ['todo', 'in_progress', 'review', 'done', 'all'], description: 'Filter by status. "all" returns everything including done.' },
+            include_done: { type: 'boolean', description: 'Whether to include completed tasks. Default false.' }
+          }
+        }
+      },
+      {
+        name: 'create_task',
+        description: 'Create a new task for the current user.',
+        parameters: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'The task title' },
+            description: { type: 'string', description: 'Optional task description' },
+            priority: { type: 'string', enum: ['low', 'medium', 'high', 'urgent'], description: 'Task priority. Default medium.' },
+            due_date: { type: 'string', description: 'Optional due date in YYYY-MM-DD format' }
+          },
+          required: ['title']
+        }
+      },
+      {
+        name: 'update_task',
+        description: "Update a task's status, priority, title, description, or due date.",
+        parameters: {
+          type: 'object',
+          properties: {
+            task_id: { type: 'integer', description: 'The task ID to update' },
+            status: { type: 'string', enum: ['todo', 'in_progress', 'review', 'done'] },
+            priority: { type: 'string', enum: ['low', 'medium', 'high', 'urgent'] },
+            title: { type: 'string', description: 'New title' },
+            description: { type: 'string', description: 'New description' },
+            due_date: { type: 'string', description: 'New due date (YYYY-MM-DD)' }
+          },
+          required: ['task_id']
+        }
+      },
+      {
+        name: 'delete_task',
+        description: 'Delete a task permanently.',
+        parameters: {
+          type: 'object',
+          properties: {
+            task_id: { type: 'integer', description: 'The task ID to delete' }
+          },
+          required: ['task_id']
+        }
+      },
+      {
+        name: 'get_team_stats',
+        description: 'Get dashboard statistics — tasks by status, tasks by member, and recent activity.',
+        parameters: { type: 'object', properties: {} }
+      },
+      {
+        name: 'submit_daily_update',
+        description: 'Submit a daily standup update for the current user.',
+        parameters: {
+          type: 'object',
+          properties: {
+            done_summary: { type: 'string', description: 'What was completed' },
+            working_on_summary: { type: 'string', description: 'What is being worked on' },
+            blockers: { type: 'string', description: 'Any blockers' }
+          }
+        }
+      },
+      {
+        name: 'list_team_members',
+        description: 'List all team members with their IDs and task counts.',
+        parameters: { type: 'object', properties: {} }
+      }
+    ]
+  }];
+
+  // ── Tool execution ──
+  async function executeTool(name, input, member) {
+    switch (name) {
+      case 'list_tasks': {
+        // Enforce: can only list your own tasks
+        let sql = `SELECT t.*, m.name as member_name FROM tasks t
+                    LEFT JOIN members m ON t.member_id = m.id
+                    WHERE t.member_id = ?`;
+        const params = [member.id];
+        if (input.status && input.status !== 'all') {
+          sql += ' AND t.status = ?';
+          params.push(input.status);
+        } else if (!input.include_done && input.status !== 'all') {
+          sql += " AND t.status != 'done'";
+        }
+        sql += ` ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, t.updated_at DESC`;
+        const tasks = await db.all(sql, params);
+        return JSON.stringify(tasks);
+      }
+
+      case 'create_task': {
+        // Enforce: always assign to current user
+        const info = await db.run(
+          'INSERT INTO tasks (title, description, status, priority, member_id, due_date) VALUES (?, ?, ?, ?, ?, ?)',
+          [input.title, input.description || '', 'todo', input.priority || 'medium', member.id, input.due_date || null]
+        );
+        await db.run(
+          'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
+          [info.lastInsertRowid, member.id, 'created', `Task "${input.title}" created via Slack agent`]
+        );
+        const task = await db.get('SELECT * FROM tasks WHERE id = ?', [info.lastInsertRowid]);
+        return JSON.stringify(task);
+      }
+
+      case 'update_task': {
+        const existing = await db.get('SELECT * FROM tasks WHERE id = ?', [input.task_id]);
+        if (!existing) return JSON.stringify({ error: 'Task not found' });
+        if (existing.member_id !== member.id) return JSON.stringify({ error: 'You can only update your own tasks.' });
+
+        const newStatus = input.status || existing.status;
+        const completedAt = newStatus === 'done' && existing.status !== 'done'
+          ? new Date().toISOString() : existing.completed_at;
+
+        await db.run(`UPDATE tasks SET
+          title = COALESCE(?, title),
+          description = COALESCE(?, description),
+          status = COALESCE(?, status),
+          priority = COALESCE(?, priority),
+          due_date = COALESCE(?, due_date),
+          completed_at = ?,
+          updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?`,
+          [input.title || null, input.description || null, input.status || null,
+           input.priority || null, input.due_date || null, completedAt, input.task_id]
+        );
+
+        if (input.status && input.status !== existing.status) {
+          await db.run(
+            'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
+            [input.task_id, existing.member_id, 'status_change',
+             `Status: ${existing.status} → ${input.status} (via Slack agent)`]
+          );
+        }
+
+        const updated = await db.get('SELECT * FROM tasks WHERE id = ?', [input.task_id]);
+        return JSON.stringify(updated);
+      }
+
+      case 'delete_task': {
+        const task = await db.get('SELECT * FROM tasks WHERE id = ?', [input.task_id]);
+        if (!task) return JSON.stringify({ error: 'Task not found' });
+        if (task.member_id !== member.id) return JSON.stringify({ error: 'You can only delete your own tasks.' });
+        await db.run('DELETE FROM tasks WHERE id = ?', [input.task_id]);
+        await db.run(
+          'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
+          [input.task_id, task.member_id, 'deleted', `Task "${task.title}" deleted via Slack agent`]
+        );
+        return JSON.stringify({ success: true, deleted: task.title });
+      }
+
+      case 'get_team_stats': {
+        const byStatus = await db.all('SELECT status, COUNT(*) as count FROM tasks GROUP BY status');
+        const byMember = await db.all(`
+          SELECT m.name, COUNT(t.id) as total,
+            SUM(CASE WHEN t.status = 'done' THEN 1 ELSE 0 END) as done,
+            SUM(CASE WHEN t.status != 'done' THEN 1 ELSE 0 END) as active
+          FROM members m LEFT JOIN tasks t ON m.id = t.member_id
+          GROUP BY m.id ORDER BY m.name`);
+        const completedToday = await db.get(
+          "SELECT COUNT(*) as count FROM tasks WHERE completed_at >= date('now')");
+        return JSON.stringify({ byStatus, byMember, completedToday: completedToday?.count || 0 });
+      }
+
+      case 'submit_daily_update': {
+        const date = new Date().toISOString().split('T')[0];
+        // Enforce: can only submit your own daily update
+        await db.run(`INSERT OR REPLACE INTO daily_updates (member_id, date, done_summary, working_on_summary, blockers)
+          VALUES (?, ?, ?, ?, ?)`,
+          [member.id, date, input.done_summary || '', input.working_on_summary || '', input.blockers || '']);
+        return JSON.stringify({ success: true, date });
+      }
+
+      case 'list_team_members': {
+        const members = await db.all(`
+          SELECT m.*, COUNT(t.id) as task_count,
+            SUM(CASE WHEN t.status != 'done' THEN 1 ELSE 0 END) as active_tasks
+          FROM members m LEFT JOIN tasks t ON m.id = t.member_id
+          GROUP BY m.id ORDER BY m.name`);
+        return JSON.stringify(members);
+      }
+
+      default:
+        return JSON.stringify({ error: 'Unknown tool' });
+    }
+  }
+
+  // ── Run Gemini agent loop (call tools until done) ──
+  async function runAgent(userMessage, member) {
+    const today = new Date().toISOString().split('T')[0];
+
+    const systemPrompt = `You are the Winning Circle task management assistant on Slack. You help team members manage their tasks through natural conversation.
+
+Current user: ${member.name} (member_id: ${member.id})
+Today's date: ${today}
+
+Guidelines:
+- Be concise and friendly — this is Slack, not email.
+- Use Slack formatting: *bold*, _italic_, \`code\`.
+- When listing tasks, use bullet points and include priority/status.
+- When a user says something vague like "I finished the design" — look up their tasks and match it to update the right one.
+- If the user asks to create a task, extract the title, priority, and due date if mentioned.
+- Always confirm actions you take (created, updated, deleted).
+- If you're not sure which task they mean, list their tasks and ask them to clarify.
+- For status updates: todo, in_progress, review, done.
+- Keep responses short — 2-4 sentences max unless listing tasks.
+
+IMPORTANT ownership rules:
+- Users can ONLY manage their own tasks.
+- They can VIEW team stats (get_team_stats, list_team_members) but cannot modify other people's tasks.
+- If someone asks to edit another person's task, politely tell them they can only manage their own.`;
+
+    const contents = [{ role: 'user', parts: [{ text: userMessage }] }];
+
+    // Agent loop — keep calling tools until Gemini gives a final text response
+    for (let i = 0; i < 5; i++) {
+      const response = await genai.models.generateContent({
+        model: 'gemini-2.0-flash',
+        contents,
+        config: {
+          systemInstruction: systemPrompt,
+          tools: TOOLS_DECLARATION,
+        },
+      });
+
+      const candidate = response.candidates?.[0];
+      if (!candidate) return "Something went wrong — try again.";
+
+      const parts = candidate.content?.parts || [];
+      const functionCalls = parts.filter(p => p.functionCall);
+      const textParts = parts.filter(p => p.text);
+
+      // If no tool calls, return the text response
+      if (functionCalls.length === 0) {
+        return textParts.map(p => p.text).join('\n') || 'Done!';
+      }
+
+      // Add model response to conversation
+      contents.push({ role: 'model', parts });
+
+      // Execute each function call and collect results
+      const functionResponses = [];
+      for (const part of functionCalls) {
+        const { name, args } = part.functionCall;
+        const result = await executeTool(name, args || {}, member);
+        functionResponses.push({
+          functionResponse: { name, response: JSON.parse(result) }
+        });
+      }
+      contents.push({ role: 'user', parts: functionResponses });
+    }
+
+    return "I got a bit stuck — try rephrasing your request.";
+  }
+
+  // ─────────── DM Handler — AI-powered task management ───────────
   slackApp.message(async ({ message, say }) => {
-    // Only handle DMs (im channel type)
     if (message.channel_type !== 'im' || message.bot_id) return;
 
     const member = await db.get('SELECT * FROM members WHERE slack_id = ?', [message.user]);
@@ -38,10 +303,30 @@ function initSlackBot(expressApp, db) {
       return;
     }
 
-    const text = (message.text || '').trim().toLowerCase();
+    const text = (message.text || '').trim();
+    if (!text || text.length > 2000) return;
 
-    // ── "my tasks" / "tasks" / "show tasks" ──
-    if (text.match(/^(my\s+)?tasks$|^show\s+(my\s+)?tasks$|^what.*(do|doing|work)/)) {
+    // If Claude is not configured, fall back to simple regex handling
+    if (!genai) {
+      await handleLegacyMessage(text, member, say);
+      return;
+    }
+
+    try {
+      const response = await runAgent(text, member);
+      await say(response);
+    } catch (e) {
+      console.error('Agent error:', e.message);
+      // Fall back to legacy handler on error
+      await handleLegacyMessage(text, member, say);
+    }
+  });
+
+  // ── Legacy regex handler (fallback when no API key) ──
+  async function handleLegacyMessage(text, member, say) {
+    const lower = text.toLowerCase();
+
+    if (lower.match(/^(my\s+)?tasks$|^show\s+(my\s+)?tasks$|^what.*(do|doing|work)/)) {
       const tasks = await db.all(
         `SELECT * FROM tasks WHERE member_id = ? AND status != 'done' ORDER BY
          CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`,
@@ -59,9 +344,8 @@ function initSlackBot(expressApp, db) {
       return;
     }
 
-    // ── "done" / "finish" / "complete" + task reference ──
-    if (text.match(/^(\d+)\s+(done|complete|finished|finish)$/)) {
-      const idx = parseInt(text.match(/^(\d+)/)[1]) - 1;
+    if (lower.match(/^(\d+)\s+(done|complete|finished|finish)$/)) {
+      const idx = parseInt(lower.match(/^(\d+)/)[1]) - 1;
       const tasks = await db.all(
         `SELECT * FROM tasks WHERE member_id = ? AND status != 'done' ORDER BY
          CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`,
@@ -80,56 +364,26 @@ function initSlackBot(expressApp, db) {
       return;
     }
 
-    // ── "<number> <status>" pattern ──
-    const statusMatch = text.match(/^(\d+)\s+(todo|in\s*progress|review|working|start)/);
-    if (statusMatch) {
-      const idx = parseInt(statusMatch[1]) - 1;
-      let newStatus = statusMatch[2].replace(/\s+/g, '_');
-      if (newStatus === 'working' || newStatus === 'start') newStatus = 'in_progress';
-      if (newStatus === 'in_progress' || newStatus === 'todo' || newStatus === 'review') {
-        const tasks = await db.all(
-          `SELECT * FROM tasks WHERE member_id = ? AND status != 'done' ORDER BY
-           CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`,
-          [member.id]
-        );
-        if (idx >= 0 && idx < tasks.length) {
-          const task = tasks[idx];
-          await db.run('UPDATE tasks SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-            [newStatus, task.id]);
-          await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
-            [task.id, member.id, 'status_change', `Status: ${task.status} → ${newStatus} (via DM)`]);
-          await say(`Moved *${task.title}* to ${statusLabel(newStatus)}.`);
-        } else {
-          await say("Couldn't find that task. Send *tasks* to see your list.");
-        }
-        return;
-      }
-    }
-
-    // ── "help" ──
-    if (text === 'help') {
+    if (lower === 'help') {
       await say(`*How to use the Winning Circle Bot:*\n\n` +
         `Send me any of these:\n` +
         `• *tasks* — see your active tasks\n` +
         `• *1 done* — mark task #1 as done\n` +
         `• *2 in progress* — move task #2 to In Progress\n` +
-        `• *3 review* — move task #3 to Review\n` +
         `• Any text — creates a new task for you\n` +
         `\nOr use slash commands: \`/tasks\`, \`/newtask\`, \`/update\``
       );
       return;
     }
 
-    // ── Default: create a new task from the message ──
     if (text.length > 2 && text.length < 200) {
-      const title = message.text.trim(); // use original casing
       const info = await db.run('INSERT INTO tasks (title, status, member_id) VALUES (?, ?, ?)',
-        [title, 'todo', member.id]);
+        [text, 'todo', member.id]);
       await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
-        [info.lastInsertRowid, member.id, 'created', `Task "${title}" created via DM`]);
-      await say(`Created task: *${title}* (To Do)\n_Send "tasks" to see your list._`);
+        [info.lastInsertRowid, member.id, 'created', `Task "${text}" created via DM`]);
+      await say(`Created task: *${text}* (To Do)\n_Send "tasks" to see your list._`);
     }
-  });
+  }
 
   // ─────────── /tasks — View your tasks ───────────
   slackApp.command('/tasks', async ({ command, ack, respond }) => {
@@ -290,7 +544,6 @@ function initSlackBot(expressApp, db) {
         const membersList = await db.all('SELECT * FROM members WHERE slack_id IS NOT NULL');
         const today = new Date().toISOString().split('T')[0];
 
-        // Send personalized DM to each member with their specific tasks
         for (const member of membersList) {
           try {
             const tasks = await db.all(
@@ -304,24 +557,24 @@ function initSlackBot(expressApp, db) {
             const priorityEmoji = { urgent: ':red_circle:', high: ':large_orange_circle:', medium: ':large_blue_circle:', low: ':white_circle:' };
 
             const blocks = [
-              { type: 'header', text: { type: 'plain_text', text: `Good morning, ${member.name}! :sunrise:` } },
+              { type: 'header', text: { type: 'plain_text', text: `Good morning, ${member.name}!` } },
             ];
 
             if (!tasks.length) {
               blocks.push({
                 type: 'section',
-                text: { type: 'mrkdwn', text: "You have no active tasks today. Create one with `/newtask` or just send me a message!" }
+                text: { type: 'mrkdwn', text: "You have no active tasks today. Just DM me to create one!" }
               });
             } else {
               if (overdue.length > 0) {
                 blocks.push({
                   type: 'section',
-                  text: { type: 'mrkdwn', text: `:warning: *${overdue.length} overdue task${overdue.length > 1 ? 's' : ''}* need attention:` }
+                  text: { type: 'mrkdwn', text: `:warning: *${overdue.length} overdue task${overdue.length > 1 ? 's' : ''}:*` }
                 });
                 overdue.forEach(t => {
                   blocks.push({
                     type: 'section',
-                    text: { type: 'mrkdwn', text: `:warning: *${t.title}*\n${priorityEmoji[t.priority] || ''} ${t.priority} | Due: ~${t.due_date}~ _overdue_` }
+                    text: { type: 'mrkdwn', text: `:warning: *${t.title}* — Due: ~${t.due_date}~ _overdue_` }
                   });
                 });
                 blocks.push({ type: 'divider' });
@@ -331,7 +584,7 @@ function initSlackBot(expressApp, db) {
               if (activeTasks.length > 0) {
                 blocks.push({
                   type: 'section',
-                  text: { type: 'mrkdwn', text: `*Your tasks today (${activeTasks.length}):*` }
+                  text: { type: 'mrkdwn', text: `*Your tasks (${activeTasks.length}):*` }
                 });
                 activeTasks.forEach(t => {
                   const due = t.due_date ? ` | Due: ${t.due_date}` : '';
@@ -348,7 +601,7 @@ function initSlackBot(expressApp, db) {
               blocks.push({ type: 'divider' });
               blocks.push({
                 type: 'section',
-                text: { type: 'mrkdwn', text: `_Reply *tasks* to see full list, *1 done* to mark task #1 complete, or use \`/update\` for standup._` }
+                text: { type: 'mrkdwn', text: `_Just tell me what you need — I understand natural language now!_` }
               });
             }
 
@@ -358,11 +611,10 @@ function initSlackBot(expressApp, db) {
           }
         }
 
-        // Also post a brief channel ping
         const mentions = membersList.map(m => `<@${m.slack_id}>`).join(' ');
         await slackApp.client.chat.postMessage({
           channel: CHANNEL_ID,
-          text: `:wave: Good morning ${mentions}! Check your DMs for your personal task reminders. Use \`/update\` to post your standup.`
+          text: `:wave: Good morning ${mentions}! Check your DMs for your personal task reminders.`
         });
       } catch (e) {
         console.error('Failed to send reminder:', e.message);
