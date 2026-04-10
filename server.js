@@ -4,6 +4,7 @@ const cors = require('cors');
 const path = require('path');
 const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
 const { initDatabase, getDB } = require('./db');
 
 const app = express();
@@ -17,14 +18,18 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret-CHANGE-IN-PRODUCTIO
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 // ---------------------------------------------------------------------------
-// Middleware
+// Middleware (skip JSON body parsing for /slack/ — Bolt handles its own)
 // ---------------------------------------------------------------------------
 app.use(cors({ credentials: true, origin: BASE_URL }));
-app.use(express.json());
+app.use((req, res, next) => {
+  if (req.originalUrl.startsWith('/slack/')) return next();
+  express.json()(req, res, next);
+});
 app.use(cookieParser());
 
-// Ensure DB is ready before handling requests
+// Ensure DB is ready before handling requests (skip for /slack/)
 app.use(async (req, res, next) => {
+  if (req.originalUrl.startsWith('/slack/')) return next();
   try {
     await initDatabase();
     next();
@@ -72,7 +77,15 @@ app.get('/auth/login', (req, res) => {
   res.redirect('/login');
 });
 
-app.post('/auth/login', (req, res) => {
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  message: { error: 'Too many login attempts. Try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.post('/auth/login', loginLimiter, (req, res) => {
   const { name, accessCode } = req.body;
   if (!name || !accessCode) {
     return res.status(400).json({ error: 'Name and Access Code are required.' });

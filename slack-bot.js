@@ -288,22 +288,81 @@ function initSlackBot(expressApp, db) {
     cron.schedule(REMINDER_CRON, async () => {
       try {
         const membersList = await db.all('SELECT * FROM members WHERE slack_id IS NOT NULL');
+        const today = new Date().toISOString().split('T')[0];
+
+        // Send personalized DM to each member with their specific tasks
+        for (const member of membersList) {
+          try {
+            const tasks = await db.all(
+              `SELECT * FROM tasks WHERE member_id = ? AND status != 'done'
+               ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`,
+              [member.id]
+            );
+
+            const overdue = tasks.filter(t => t.due_date && t.due_date < today);
+            const statusEmoji = { todo: ':white_circle:', in_progress: ':arrow_forward:', review: ':eyes:' };
+            const priorityEmoji = { urgent: ':red_circle:', high: ':large_orange_circle:', medium: ':large_blue_circle:', low: ':white_circle:' };
+
+            const blocks = [
+              { type: 'header', text: { type: 'plain_text', text: `Good morning, ${member.name}! :sunrise:` } },
+            ];
+
+            if (!tasks.length) {
+              blocks.push({
+                type: 'section',
+                text: { type: 'mrkdwn', text: "You have no active tasks today. Create one with `/newtask` or just send me a message!" }
+              });
+            } else {
+              if (overdue.length > 0) {
+                blocks.push({
+                  type: 'section',
+                  text: { type: 'mrkdwn', text: `:warning: *${overdue.length} overdue task${overdue.length > 1 ? 's' : ''}* need attention:` }
+                });
+                overdue.forEach(t => {
+                  blocks.push({
+                    type: 'section',
+                    text: { type: 'mrkdwn', text: `:warning: *${t.title}*\n${priorityEmoji[t.priority] || ''} ${t.priority} | Due: ~${t.due_date}~ _overdue_` }
+                  });
+                });
+                blocks.push({ type: 'divider' });
+              }
+
+              const activeTasks = tasks.filter(t => !overdue.includes(t));
+              if (activeTasks.length > 0) {
+                blocks.push({
+                  type: 'section',
+                  text: { type: 'mrkdwn', text: `*Your tasks today (${activeTasks.length}):*` }
+                });
+                activeTasks.forEach(t => {
+                  const due = t.due_date ? ` | Due: ${t.due_date}` : '';
+                  blocks.push({
+                    type: 'section',
+                    text: {
+                      type: 'mrkdwn',
+                      text: `${statusEmoji[t.status] || ':white_circle:'} *${t.title}*\n${priorityEmoji[t.priority] || ''} ${t.priority} | ${statusLabel(t.status)}${due}`
+                    }
+                  });
+                });
+              }
+
+              blocks.push({ type: 'divider' });
+              blocks.push({
+                type: 'section',
+                text: { type: 'mrkdwn', text: `_Reply *tasks* to see full list, *1 done* to mark task #1 complete, or use \`/update\` for standup._` }
+              });
+            }
+
+            await slackApp.client.chat.postMessage({ channel: member.slack_id, blocks });
+          } catch (e) {
+            console.error(`Failed to DM ${member.name}:`, e.message);
+          }
+        }
+
+        // Also post a brief channel ping
         const mentions = membersList.map(m => `<@${m.slack_id}>`).join(' ');
         await slackApp.client.chat.postMessage({
           channel: CHANNEL_ID,
-          blocks: [
-            { type: 'header', text: { type: 'plain_text', text: 'Daily Standup Reminder' } },
-            {
-              type: 'section',
-              text: {
-                type: 'mrkdwn',
-                text: `Hey team! ${mentions}\n\nTime to share your daily update:\n` +
-                  `• DM me directly to manage tasks\n` +
-                  `• Use \`/update\` to submit your standup\n` +
-                  `• Use \`/tasks\` to view and update statuses`
-              }
-            }
-          ]
+          text: `:wave: Good morning ${mentions}! Check your DMs for your personal task reminders. Use \`/update\` to post your standup.`
         });
       } catch (e) {
         console.error('Failed to send reminder:', e.message);
