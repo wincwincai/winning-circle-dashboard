@@ -111,7 +111,8 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
   );
 
   if (!member) {
-    return res.status(403).json({ error: 'You are not a registered team member. Ask your admin to add you first.' });
+    const names = allMembers.map(m => m.name);
+    return res.status(403).json({ error: `No member found matching "${name.trim()}". Registered members: ${names.join(', ')}` });
   }
 
   // Issue JWT with member_id
