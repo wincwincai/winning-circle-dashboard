@@ -1,13 +1,13 @@
 /**
  * Slack Bot Integration for Winning Circle Dashboard
  *
- * AI-powered task management agent using Gemini.
- * Team members DM the bot naturally and Gemini handles everything
+ * AI-powered task management agent using Groq (Llama).
+ * Team members DM the bot naturally and the LLM handles everything
  * via tool use — creating, updating, listing, and managing tasks.
  */
 
 const { App, ExpressReceiver } = require('@slack/bolt');
-const { GoogleGenAI } = require('@google/genai');
+const Groq = require('groq-sdk');
 const cron = require('node-cron');
 
 function initSlackBot(expressApp, db) {
@@ -25,14 +25,15 @@ function initSlackBot(expressApp, db) {
   const CHANNEL_ID = process.env.SLACK_CHANNEL_ID || '';
   const REMINDER_CRON = process.env.REMINDER_CRON || '0 9 * * 1-5';
 
-  // ─────────── Gemini AI Agent ───────────
-  const genai = process.env.GEMINI_API_KEY
-    ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  // ─────────── Groq AI Agent ───────────
+  const groq = process.env.GROQ_API_KEY
+    ? new Groq({ apiKey: process.env.GROQ_API_KEY })
     : null;
 
-  const TOOLS_DECLARATION = [{
-    functionDeclarations: [
-      {
+  const TOOLS = [
+    {
+      type: 'function',
+      function: {
         name: 'list_tasks',
         description: 'List tasks for the current user. Returns active tasks by default, or filter by status.',
         parameters: {
@@ -42,8 +43,11 @@ function initSlackBot(expressApp, db) {
             include_done: { type: 'boolean', description: 'Whether to include completed tasks. Default false.' }
           }
         }
-      },
-      {
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'create_task',
         description: 'Create a new task for the current user.',
         parameters: {
@@ -56,8 +60,11 @@ function initSlackBot(expressApp, db) {
           },
           required: ['title']
         }
-      },
-      {
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'update_task',
         description: "Update a task's status, priority, title, description, or due date.",
         parameters: {
@@ -72,8 +79,11 @@ function initSlackBot(expressApp, db) {
           },
           required: ['task_id']
         }
-      },
-      {
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'delete_task',
         description: 'Delete a task permanently.',
         parameters: {
@@ -83,13 +93,19 @@ function initSlackBot(expressApp, db) {
           },
           required: ['task_id']
         }
-      },
-      {
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'get_team_stats',
         description: 'Get dashboard statistics — tasks by status, tasks by member, and recent activity.',
         parameters: { type: 'object', properties: {} }
-      },
-      {
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'submit_daily_update',
         description: 'Submit a daily standup update for the current user.',
         parameters: {
@@ -100,14 +116,17 @@ function initSlackBot(expressApp, db) {
             blockers: { type: 'string', description: 'Any blockers' }
           }
         }
-      },
-      {
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'list_team_members',
         description: 'List all team members with their IDs and task counts.',
         parameters: { type: 'object', properties: {} }
       }
-    ]
-  }];
+    }
+  ];
 
   // ── Tool execution ──
   async function executeTool(name, input, member) {
@@ -225,7 +244,7 @@ function initSlackBot(expressApp, db) {
     }
   }
 
-  // ── Run Gemini agent loop (call tools until done) ──
+  // ── Run Groq agent loop (call tools until done) ──
   async function runAgent(userMessage, member) {
     const today = new Date().toISOString().split('T')[0];
 
@@ -250,44 +269,39 @@ IMPORTANT ownership rules:
 - They can VIEW team stats (get_team_stats, list_team_members) but cannot modify other people's tasks.
 - If someone asks to edit another person's task, politely tell them they can only manage their own.`;
 
-    const contents = [{ role: 'user', parts: [{ text: userMessage }] }];
+    let messages = [{ role: 'user', content: userMessage }];
 
-    // Agent loop — keep calling tools until Gemini gives a final text response
+    // Agent loop — keep calling tools until LLM gives a final text response
     for (let i = 0; i < 5; i++) {
-      const response = await genai.models.generateContent({
-        model: 'gemini-2.0-flash',
-        contents,
-        config: {
-          systemInstruction: systemPrompt,
-          tools: TOOLS_DECLARATION,
-        },
+      const response = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'system', content: systemPrompt }, ...messages],
+        tools: TOOLS,
+        tool_choice: 'auto',
+        max_tokens: 1024,
       });
 
-      const candidate = response.candidates?.[0];
-      if (!candidate) return "Something went wrong — try again.";
+      const choice = response.choices?.[0];
+      if (!choice) return "Something went wrong — try again.";
 
-      const parts = candidate.content?.parts || [];
-      const functionCalls = parts.filter(p => p.functionCall);
-      const textParts = parts.filter(p => p.text);
+      const msg = choice.message;
+      messages.push(msg);
 
-      // If no tool calls, return the text response
-      if (functionCalls.length === 0) {
-        return textParts.map(p => p.text).join('\n') || 'Done!';
+      // If no tool calls, return the text
+      if (!msg.tool_calls || msg.tool_calls.length === 0) {
+        return msg.content || 'Done!';
       }
 
-      // Add model response to conversation
-      contents.push({ role: 'model', parts });
-
-      // Execute each function call and collect results
-      const functionResponses = [];
-      for (const part of functionCalls) {
-        const { name, args } = part.functionCall;
-        const result = await executeTool(name, args || {}, member);
-        functionResponses.push({
-          functionResponse: { name, response: JSON.parse(result) }
+      // Execute each tool call and add results
+      for (const toolCall of msg.tool_calls) {
+        const args = JSON.parse(toolCall.function.arguments || '{}');
+        const result = await executeTool(toolCall.function.name, args, member);
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: result,
         });
       }
-      contents.push({ role: 'user', parts: functionResponses });
     }
 
     return "I got a bit stuck — try rephrasing your request.";
@@ -307,7 +321,7 @@ IMPORTANT ownership rules:
     if (!text || text.length > 2000) return;
 
     // If Claude is not configured, fall back to simple regex handling
-    if (!genai) {
+    if (!groq) {
       await handleLegacyMessage(text, member, say);
       return;
     }
