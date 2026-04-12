@@ -294,7 +294,7 @@ IMPORTANT ownership rules:
 
       // Execute each tool call and add results
       for (const toolCall of msg.tool_calls) {
-        const args = JSON.parse(toolCall.function.arguments || '{}');
+        const args = JSON.parse(toolCall.function.arguments || '{}') || {};
         const result = await executeTool(toolCall.function.name, args, member);
         messages.push({
           role: 'tool',
@@ -354,7 +354,7 @@ IMPORTANT ownership rules:
       const response = await runAgent(text, member);
       await say(response);
     } catch (e) {
-      console.error('Agent error:', e.message);
+      console.error('Agent error:', e.message, e.stack);
       // Fall back to legacy handler on error
       await handleLegacyMessage(text, member, say);
     }
