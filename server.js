@@ -57,6 +57,12 @@ function requireAuth(req, res, next) {
   }
   try {
     req.user = jwt.verify(token, JWT_SECRET);
+    // Force re-login if JWT is from before ownership update (missing member_id)
+    if (!req.user.member_id) {
+      res.clearCookie('wc_token');
+      if (isApiRequest(req)) return res.status(401).json({ error: 'Please log in again.' });
+      return res.redirect('/login?reason=session_expired');
+    }
     next();
   } catch (err) {
     console.log('[Auth] JWT Verify failed:', err.message);
