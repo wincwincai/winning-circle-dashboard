@@ -311,16 +311,40 @@ IMPORTANT ownership rules:
   slackApp.message(async ({ message, say }) => {
     if (message.channel_type !== 'im' || message.bot_id) return;
 
-    const member = await db.get('SELECT * FROM members WHERE slack_id = ?', [message.user]);
+    let member = await db.get('SELECT * FROM members WHERE slack_id = ?', [message.user]);
+
+    // Auto-link: if no member found by slack_id, try matching by Slack display name
     if (!member) {
-      await say(`Hi! You're not linked to the dashboard yet. Ask your admin to add your Slack ID: \`${message.user}\``);
-      return;
+      try {
+        const userInfo = await slackApp.client.users.info({ user: message.user });
+        const slackName = userInfo.user?.real_name || userInfo.user?.profile?.display_name || '';
+        if (slackName) {
+          // Try case-insensitive match against existing members
+          const allMembers = await db.all('SELECT * FROM members');
+          member = allMembers.find(m =>
+            m.name.localeCompare(slackName, undefined, { sensitivity: 'accent' }) === 0 ||
+            m.name.localeCompare(slackName.split(' ')[0], undefined, { sensitivity: 'accent' }) === 0
+          );
+          if (member) {
+            // Link this Slack ID to the matched member
+            await db.run('UPDATE members SET slack_id = ? WHERE id = ?', [message.user, member.id]);
+            await say(`Linked you to *${member.name}* on the dashboard. You're all set!`);
+          }
+        }
+      } catch (e) {
+        console.error('Auto-link error:', e.message);
+      }
+
+      if (!member) {
+        await say(`Hi! I couldn't match your Slack profile to a dashboard member.\nYour Slack ID: \`${message.user}\`\n\nEither log in to the dashboard first (your name must match), or ask an admin to link your Slack ID.`);
+        return;
+      }
     }
 
     const text = (message.text || '').trim();
     if (!text || text.length > 2000) return;
 
-    // If Claude is not configured, fall back to simple regex handling
+    // If Groq is not configured, fall back to simple regex handling
     if (!groq) {
       await handleLegacyMessage(text, member, say);
       return;
