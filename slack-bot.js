@@ -355,8 +355,16 @@ IMPORTANT ownership rules:
       await say(response);
     } catch (e) {
       console.error('Agent error:', e.message, e.stack);
-      // Fall back to legacy handler on error
-      await handleLegacyMessage(text, member, say);
+      // Retry once after a short delay (handles rate limits)
+      try {
+        await new Promise(r => setTimeout(r, 1500));
+        const response = await runAgent(text, member);
+        await say(response);
+      } catch (e2) {
+        console.error('Agent retry failed:', e2.message);
+        await say(`_AI is temporarily unavailable — using basic mode._`);
+        await handleLegacyMessage(text, member, say);
+      }
     }
   });
 
@@ -414,13 +422,19 @@ IMPORTANT ownership rules:
       return;
     }
 
-    if (text.length > 2 && text.length < 200) {
+    // Only create tasks when explicitly requested (e.g., "create task fix the bug" or "new task deploy v2")
+    const createMatch = lower.match(/^(?:create|new|add)\s+(?:a\s+)?(?:task\s+)?(.+)/);
+    if (createMatch && createMatch[1].length > 1 && createMatch[1].length < 200) {
+      const title = createMatch[1].trim();
       const info = await db.run('INSERT INTO tasks (title, status, member_id) VALUES (?, ?, ?)',
-        [text, 'todo', member.id]);
+        [title, 'todo', member.id]);
       await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
-        [info.lastInsertRowid, member.id, 'created', `Task "${text}" created via DM`]);
-      await say(`Created task: *${text}* (To Do)\n_Send "tasks" to see your list._`);
+        [info.lastInsertRowid, member.id, 'created', `Task "${title}" created via DM`]);
+      await say(`Created task: *${title}* (To Do)\n_Send "tasks" to see your list._`);
+      return;
     }
+
+    await say(`I didn't understand that. Try:\n• *tasks* — see your task list\n• *1 done* — mark task #1 as done\n• *create <task name>* — create a new task\n• *help* — see all commands`);
   }
 
   // ─────────── /tasks — View your tasks ───────────
