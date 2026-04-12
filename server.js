@@ -101,18 +101,24 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
     return res.status(401).json({ error: 'Invalid access code.' });
   }
 
-  // Match to a team member (case-insensitive, Unicode-safe)
+  // Match to a team member, or auto-create if they have the correct access code
   await initDatabase();
   const db = getDB();
   const allMembers = await db.all('SELECT * FROM members');
   const trimmedName = name.trim();
-  const member = allMembers.find(m =>
+  let member = allMembers.find(m =>
     m.name.localeCompare(trimmedName, undefined, { sensitivity: 'accent' }) === 0
   );
 
+  // Auto-create member if they have the right access code but no member record
   if (!member) {
-    const names = allMembers.map(m => m.name);
-    return res.status(403).json({ error: `No member found matching "${name.trim()}". Registered members: ${names.join(', ')}` });
+    const colors = ['#6366f1', '#8b5cf6', '#ec4899', '#f43f5e', '#f97316', '#eab308', '#22c55e', '#06b6d4'];
+    const color = colors[allMembers.length % colors.length];
+    const info = await db.run(
+      'INSERT INTO members (name, avatar_color) VALUES (?, ?)',
+      [trimmedName, color]
+    );
+    member = await db.get('SELECT * FROM members WHERE id = ?', [info.lastInsertRowid]);
   }
 
   // Issue JWT with member_id
