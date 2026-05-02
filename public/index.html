@@ -184,6 +184,28 @@ input, textarea, select { font-family: inherit; }
 .toast.success { border-left: 3px solid var(--green); }
 .toast.error { border-left: 3px solid var(--red); }
 @keyframes slideIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+/* ───────── Admin Panel ───────── */
+.admin-container { padding: 24px; }
+.admin-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+.admin-header h3 { font-size: 18px; font-weight: 600; }
+.admin-tabs { display: flex; gap: 4px; background: var(--surface2); border-radius: var(--radius-sm); padding: 4px; margin-bottom: 20px; width: fit-content; }
+.admin-tab { padding: 7px 20px; border-radius: calc(var(--radius-sm) - 2px); font-size: 13px; font-weight: 500; border: none; background: none; color: var(--text-dim); cursor: pointer; transition: all .15s; }
+.admin-tab.active { background: var(--surface); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.3); }
+.admin-members-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.admin-member-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; display: flex; align-items: center; gap: 14px; transition: border-color .15s; }
+.admin-member-card:hover { border-color: var(--accent); }
+.admin-member-info { flex: 1; min-width: 0; }
+.admin-member-name { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.admin-member-meta { font-size: 12px; color: var(--text-dim); margin-top: 4px; line-height: 1.6; }
+.badge { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.badge-admin { background: rgba(99,102,241,.2); color: var(--accent); border: 1px solid rgba(99,102,241,.3); }
+.admin-member-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.admin-tasks-wrap { overflow-x: auto; }
+table.admin-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.admin-table th { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim); padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.admin-table td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.admin-table tr:hover td { background: var(--surface2); }
+.admin-table select { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 4px; padding: 4px 6px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -223,6 +245,13 @@ input, textarea, select { font-family: inherit; }
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
         Add Member
       </button>
+      <div id="adminNavSection" style="display:none">
+        <div class="nav-section">Admin</div>
+        <button class="nav-item" data-view="admin" onclick="switchView('admin')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          Admin Panel
+        </button>
+      </div>
     </nav>
   </aside>
 
@@ -304,6 +333,7 @@ input, textarea, select { font-family: inherit; }
     <div id="teamView" class="view" style="display:none"></div>
     <div id="activityView" class="view" style="display:none"></div>
     <div id="dailyView" class="view" style="display:none"></div>
+    <div id="adminView" class="view" style="display:none"></div>
   </div>
 </div>
 
@@ -362,6 +392,32 @@ input, textarea, select { font-family: inherit; }
   </div>
 </div>
 
+<!-- Admin Edit Member Modal -->
+<div class="modal-overlay" id="adminMemberModal">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="adminMemberModalTitle">Edit Member</h3>
+      <button class="btn-icon" onclick="closeModal('adminMemberModal')">&times;</button>
+    </div>
+    <div class="modal-body">
+      <input type="hidden" id="adminMemberId">
+      <div class="form-group"><label>Name</label><input type="text" id="adminMemberName" placeholder="Full name"></div>
+      <div class="form-group"><label>Slack User ID</label><input type="text" id="adminMemberSlackId" placeholder="e.g. U01ABC23DEF"></div>
+      <div class="form-group"><label>Avatar Color</label><input type="color" id="adminMemberColor" value="#6366f1" style="height:40px"></div>
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+          <input type="checkbox" id="adminMemberIsAdmin" style="width:16px;height:16px;accent-color:var(--accent)">
+          <span>Admin — can access the Admin Panel</span>
+        </label>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeModal('adminMemberModal')">Cancel</button>
+      <button class="btn btn-primary" onclick="saveAdminMember()">Save Changes</button>
+    </div>
+  </div>
+</div>
+
 <!-- Member Modal -->
 <div class="modal-overlay" id="memberModal">
   <div class="modal">
@@ -414,6 +470,8 @@ async function init() {
     document.getElementById('userAvatarFallback').textContent = initials;
     document.getElementById('userAvatarFallback').style.display = 'flex';
     document.getElementById('userMenu').style.display = 'flex';
+    // Show admin nav section if admin
+    if (me.is_admin) document.getElementById('adminNavSection').style.display = 'block';
   } catch {
     window.location.href = '/login';
     return;
@@ -606,7 +664,7 @@ function switchView(view) {
   document.getElementById(view + 'View').style.display = '';
   document.querySelectorAll('.nav-item[data-view]').forEach(n => n.classList.remove('active'));
   document.querySelector(`.nav-item[data-view="${view}"]`)?.classList.add('active');
-  const titles = { kanban:'Kanban Board', overview:'Overview', team:'Team', activity:'Activity', daily:'Daily Updates' };
+  const titles = { kanban:'Kanban Board', overview:'Overview', team:'Team', activity:'Activity', daily:'Daily Updates', admin:'Admin Panel' };
   document.getElementById('viewTitle').textContent = titles[view] || '';
   document.getElementById('filterBar').style.display = view === 'kanban' ? 'flex' : 'none';
   renderCurrentView();
@@ -616,11 +674,12 @@ function switchView(view) {
 
 async function renderCurrentView() {
   switch (currentView) {
-    case 'kanban': renderKanban(); break;
+    case 'kanban':   renderKanban(); break;
     case 'overview': await renderOverview(); break;
-    case 'team': await renderTeam(); break;
+    case 'team':     await renderTeam(); break;
     case 'activity': await renderActivity(); break;
-    case 'daily': await renderDaily(); break;
+    case 'daily':    await renderDaily(); break;
+    case 'admin':    await renderAdminView(); break;
   }
 }
 
@@ -745,6 +804,167 @@ function toast(msg, type='success') {
   el.textContent = msg;
   document.getElementById('toasts').appendChild(el);
   setTimeout(() => el.remove(), 3000);
+}
+
+// ─────────── Admin Panel ───────────
+let adminTab = 'members';
+let adminMembers = [];
+
+async function renderAdminView() {
+  document.getElementById('adminView').innerHTML = `
+    <div class="admin-container">
+      <div class="admin-header">
+        <h3>Admin Panel</h3>
+        <button class="btn btn-primary btn-sm" onclick="adminOpenAddMember()">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add Member
+        </button>
+      </div>
+      <div class="admin-tabs">
+        <button class="admin-tab ${adminTab==='members'?'active':''}" onclick="switchAdminTab('members')">👥 Members</button>
+        <button class="admin-tab ${adminTab==='tasks'?'active':''}" onclick="switchAdminTab('tasks')">📋 All Tasks</button>
+      </div>
+      <div id="adminTabContent"></div>
+    </div>`;
+  await switchAdminTab(adminTab);
+}
+
+async function switchAdminTab(tab) {
+  adminTab = tab;
+  document.querySelectorAll('.admin-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.admin-tab')[tab === 'members' ? 0 : 1]?.classList.add('active');
+  if (tab === 'members') await renderAdminMembers();
+  else await renderAdminTasks();
+}
+
+async function renderAdminMembers() {
+  adminMembers = await api('/api/admin/members');
+  const html = adminMembers.map(m => {
+    const initials = m.name.split(' ').map(n => n[0]).join('').slice(0,2).toUpperCase();
+    return `
+    <div class="admin-member-card">
+      <div class="avatar" style="background:${m.avatar_color};width:44px;height:44px;font-size:16px">${initials}</div>
+      <div class="admin-member-info">
+        <div class="admin-member-name">
+          ${escapeHtml(m.name)}
+          ${m.is_admin ? '<span class="badge badge-admin">Admin</span>' : ''}
+        </div>
+        <div class="admin-member-meta">
+          📋 ${m.active_tasks||0} active · ✅ ${m.done_tasks||0} done<br>
+          ${m.slack_id ? '💬 ' + m.slack_id : '<span style="color:var(--text-dim)">No Slack ID</span>'}
+        </div>
+      </div>
+      <div class="admin-member-actions">
+        <button class="btn btn-sm" onclick="adminEditMember(${m.id})">Edit</button>
+        <button class="btn btn-sm" style="border-color:var(--red);color:var(--red)" onclick="adminDeleteMember(${m.id},'${escapeHtml(m.name)}')">Del</button>
+      </div>
+    </div>`;
+  }).join('');
+  document.getElementById('adminTabContent').innerHTML =
+    `<div class="admin-members-grid">${html || '<p style="color:var(--text-dim)">No members yet.</p>'}</div>`;
+}
+
+function adminOpenAddMember() {
+  document.getElementById('adminMemberModalTitle').textContent = 'Add Member';
+  document.getElementById('adminMemberId').value = '';
+  document.getElementById('adminMemberName').value = '';
+  document.getElementById('adminMemberSlackId').value = '';
+  document.getElementById('adminMemberColor').value = '#6366f1';
+  document.getElementById('adminMemberIsAdmin').checked = false;
+  openModal('adminMemberModal');
+}
+
+function adminEditMember(id) {
+  const m = adminMembers.find(x => x.id === id);
+  if (!m) return;
+  document.getElementById('adminMemberModalTitle').textContent = 'Edit Member';
+  document.getElementById('adminMemberId').value = m.id;
+  document.getElementById('adminMemberName').value = m.name;
+  document.getElementById('adminMemberSlackId').value = m.slack_id || '';
+  document.getElementById('adminMemberColor').value = m.avatar_color || '#6366f1';
+  document.getElementById('adminMemberIsAdmin').checked = !!m.is_admin;
+  openModal('adminMemberModal');
+}
+
+async function saveAdminMember() {
+  const id = document.getElementById('adminMemberId').value;
+  const body = {
+    name: document.getElementById('adminMemberName').value.trim(),
+    slack_id: document.getElementById('adminMemberSlackId').value.trim(),
+    avatar_color: document.getElementById('adminMemberColor').value,
+    is_admin: document.getElementById('adminMemberIsAdmin').checked,
+  };
+  if (!body.name) return toast('Name is required', 'error');
+  if (id) {
+    await api(`/api/admin/members/${id}`, { method: 'PUT', body });
+    toast('Member updated', 'success');
+  } else {
+    await api('/api/members', { method: 'POST', body });
+    toast(`${body.name} added`, 'success');
+  }
+  closeModal('adminMemberModal');
+  await loadMembers();
+  await renderAdminMembers();
+}
+
+async function adminDeleteMember(id, name) {
+  if (!confirm(`Delete "${name}"? Their tasks will become unassigned.`)) return;
+  const r = await api(`/api/admin/members/${id}`, { method: 'DELETE' });
+  if (r.error) return toast(r.error, 'error');
+  toast(`${name} removed`, 'success');
+  await loadMembers();
+  await renderAdminMembers();
+}
+
+async function renderAdminTasks() {
+  const [allTasks, allMems] = await Promise.all([
+    api('/api/admin/tasks'),
+    api('/api/admin/members')
+  ]);
+  const memberOpts = allMems.map(m => `<option value="${m.id}">${escapeHtml(m.name)}</option>`).join('');
+  const rows = allTasks.map(t => `
+    <tr>
+      <td><span style="font-weight:500">${escapeHtml(t.title)}</span>${t.description?'<br><small style="color:var(--text-dim)">'+escapeHtml(t.description)+'</small>':''}</td>
+      <td><span class="task-priority ${t.priority}">${t.priority}</span></td>
+      <td>
+        <select onchange="adminUpdateTaskStatus(${t.id},this.value)">
+          ${['todo','in_progress','review','done'].map(s=>`<option value="${s}"${t.status===s?' selected':''}>${statusLabel(s)}</option>`).join('')}
+        </select>
+      </td>
+      <td>
+        <select onchange="adminReassignTask(${t.id},this.value)">
+          <option value="">Unassigned</option>${memberOpts.replace(`value="${t.member_id}"`,`value="${t.member_id}" selected`)}
+        </select>
+      </td>
+      <td style="color:var(--text-dim);white-space:nowrap">${t.due_date||'—'}</td>
+      <td>
+        <button class="btn-icon btn-sm" style="color:var(--red)" onclick="adminDeleteTaskById(${t.id})" title="Delete">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
+      </td>
+    </tr>`);
+  document.getElementById('adminTabContent').innerHTML = `
+    <div class="admin-tasks-wrap">
+      <table class="admin-table">
+        <thead><tr><th>Task</th><th>Priority</th><th>Status</th><th>Assignee</th><th>Due</th><th></th></tr></thead>
+        <tbody>${rows.join('') || '<tr><td colspan="6" style="color:var(--text-dim);text-align:center;padding:32px">No tasks yet</td></tr>'}</tbody>
+      </table>
+    </div>`;
+}
+
+async function adminUpdateTaskStatus(id, status) {
+  await api(`/api/admin/tasks/${id}`, { method: 'PUT', body: { status } });
+  toast('Status updated', 'success');
+}
+async function adminReassignTask(id, memberId) {
+  await api(`/api/admin/tasks/${id}`, { method: 'PUT', body: { member_id: memberId || null } });
+  toast('Task reassigned', 'success');
+}
+async function adminDeleteTaskById(id) {
+  if (!confirm('Delete this task permanently?')) return;
+  await api(`/api/admin/tasks/${id}`, { method: 'DELETE' });
+  toast('Task deleted', 'success');
+  await renderAdminTasks();
 }
 
 // ─────────── Boot ───────────

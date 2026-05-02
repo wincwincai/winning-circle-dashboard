@@ -14,6 +14,7 @@ const PORT = process.env.PORT || 3000;
 // Authentication Config
 // ---------------------------------------------------------------------------
 const TEAM_ACCESS_CODE = process.env.TEAM_ACCESS_CODE || 'winningcircle-dev';
+const ADMIN_ACCESS_CODE = process.env.ADMIN_ACCESS_CODE || null;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret-CHANGE-IN-PRODUCTION';
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
@@ -97,11 +98,12 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
     return res.status(400).json({ error: 'Name and Access Code are required.' });
   }
 
-  if (accessCode !== TEAM_ACCESS_CODE) {
+  const isAdminLogin = ADMIN_ACCESS_CODE && accessCode === ADMIN_ACCESS_CODE;
+  const isTeamLogin  = accessCode === TEAM_ACCESS_CODE;
+  if (!isAdminLogin && !isTeamLogin) {
     return res.status(401).json({ error: 'Invalid access code.' });
   }
 
-  // Match to a team member, or auto-create if they have the correct access code
   await initDatabase();
   const db = getDB();
   const allMembers = await db.all('SELECT * FROM members');
@@ -110,7 +112,6 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
     m.name.localeCompare(trimmedName, undefined, { sensitivity: 'accent' }) === 0
   );
 
-  // Auto-create member if they have the right access code but no member record
   if (!member) {
     const colors = ['#6366f1', '#8b5cf6', '#ec4899', '#f43f5e', '#f97316', '#eab308', '#22c55e', '#06b6d4'];
     const color = colors[allMembers.length % colors.length];
@@ -121,9 +122,14 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
     member = await db.get('SELECT * FROM members WHERE id = ?', [info.lastInsertRowid]);
   }
 
-  // Issue JWT with member_id
+  // Persist admin flag if logging in with admin code
+  if (isAdminLogin && !member.is_admin) {
+    await db.run('UPDATE members SET is_admin = 1 WHERE id = ?', [member.id]);
+    member.is_admin = 1;
+  }
+
   const token = jwt.sign(
-    { name: member.name, member_id: member.id },
+    { name: member.name, member_id: member.id, is_admin: member.is_admin === 1 },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -132,7 +138,7 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
     httpOnly: true,
     secure: req.secure || req.headers['x-forwarded-proto'] === 'https',
     sameSite: 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 
   res.json({ success: true });
@@ -169,8 +175,104 @@ app.get('/api/me', async (req, res) => {
   res.json({
     name: req.user.name,
     member_id: req.user.member_id,
+    is_admin: req.user.is_admin || false,
     avatar_color: member?.avatar_color || '#6366f1',
   });
+});
+
+// ---------------------------------------------------------------------------
+// Admin middleware
+// ---------------------------------------------------------------------------
+function requireAdmin(req, res, next) {
+  if (!req.user?.is_admin) return res.status(403).json({ error: 'Admin access required.' });
+  next();
+}
+
+// ---------------------------------------------------------------------------
+// Admin API — Members
+// ---------------------------------------------------------------------------
+app.get('/api/admin/members', requireAuth, requireAdmin, async (req, res) => {
+  const db = getDB();
+  const members = await db.all(`
+    SELECT m.*,
+      COUNT(t.id) as task_count,
+      SUM(CASE WHEN t.status != 'done' THEN 1 ELSE 0 END) as active_tasks,
+      SUM(CASE WHEN t.status = 'done'  THEN 1 ELSE 0 END) as done_tasks
+    FROM members m LEFT JOIN tasks t ON m.id = t.member_id
+    GROUP BY m.id ORDER BY m.name
+  `);
+  res.json(members);
+});
+
+app.put('/api/admin/members/:id', requireAuth, requireAdmin, async (req, res) => {
+  const db = getDB();
+  const id = parseInt(req.params.id);
+  const { name, slack_id, avatar_color, is_admin } = req.body;
+  await db.run(
+    `UPDATE members SET
+      name         = COALESCE(?, name),
+      slack_id     = ?,
+      avatar_color = COALESCE(?, avatar_color),
+      is_admin     = COALESCE(?, is_admin)
+    WHERE id = ?`,
+    [name || null, slack_id !== undefined ? (slack_id || null) : undefined,
+     avatar_color || null, is_admin !== undefined ? (is_admin ? 1 : 0) : null, id]
+  );
+  res.json(await db.get('SELECT * FROM members WHERE id = ?', [id]));
+});
+
+app.delete('/api/admin/members/:id', requireAuth, requireAdmin, async (req, res) => {
+  const db = getDB();
+  const id = parseInt(req.params.id);
+  if (id === req.user.member_id) return res.status(400).json({ error: "Can't delete your own account." });
+  await db.run('DELETE FROM members WHERE id = ?', [id]);
+  res.json({ success: true });
+});
+
+// ---------------------------------------------------------------------------
+// Admin API — Tasks (full access, no ownership filter)
+// ---------------------------------------------------------------------------
+app.get('/api/admin/tasks', requireAuth, requireAdmin, async (req, res) => {
+  const db = getDB();
+  const { status, member_id } = req.query;
+  let sql = `SELECT t.*, m.name as member_name, m.avatar_color
+             FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE 1=1`;
+  const params = [];
+  if (status)    { sql += ' AND t.status = ?';    params.push(status); }
+  if (member_id) { sql += ' AND t.member_id = ?'; params.push(parseInt(member_id)); }
+  sql += ` ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, t.updated_at DESC`;
+  res.json(await db.all(sql, params));
+});
+
+app.put('/api/admin/tasks/:id', requireAuth, requireAdmin, async (req, res) => {
+  const db = getDB();
+  const taskId = parseInt(req.params.id);
+  const existing = await db.get('SELECT * FROM tasks WHERE id = ?', [taskId]);
+  if (!existing) return res.status(404).json({ error: 'Task not found' });
+  const { title, description, status, priority, member_id, due_date } = req.body;
+  const newStatus = status || existing.status;
+  const completedAt = newStatus === 'done' && existing.status !== 'done'
+    ? new Date().toISOString() : existing.completed_at;
+  await db.run(`UPDATE tasks SET
+    title = COALESCE(?, title), description = COALESCE(?, description),
+    status = COALESCE(?, status), priority = COALESCE(?, priority),
+    member_id = COALESCE(?, member_id), due_date = COALESCE(?, due_date),
+    completed_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+    [title||null, description||null, status||null, priority||null,
+     member_id||null, due_date||null, completedAt, taskId]);
+  if (status && status !== existing.status) {
+    await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
+      [taskId, existing.member_id, 'status_change', `Status: ${existing.status} → ${status} (admin)`]);
+  }
+  res.json(await db.get(
+    'SELECT t.*, m.name as member_name, m.avatar_color FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE t.id = ?',
+    [taskId]));
+});
+
+app.delete('/api/admin/tasks/:id', requireAuth, requireAdmin, async (req, res) => {
+  const db = getDB();
+  await db.run('DELETE FROM tasks WHERE id = ?', [parseInt(req.params.id)]);
+  res.json({ success: true });
 });
 
 // ---------------------------------------------------------------------------

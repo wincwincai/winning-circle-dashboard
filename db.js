@@ -176,6 +176,11 @@ async function initDatabase() {
     await _db.run(sql);
   }
 
+  // Migration: add is_admin column (safe — ignored if already exists)
+  try {
+    await _db.run('ALTER TABLE members ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0');
+  } catch (e) { /* column already exists */ }
+
   return _db;
 }
 
