@@ -7,7 +7,8 @@
  */
 
 const { App, ExpressReceiver } = require('@slack/bolt');
-const Groq = require('groq-sdk');
+const GroqModule = require('groq-sdk');
+const Groq = GroqModule.default || GroqModule;
 const cron = require('node-cron');
 
 function initSlackBot(expressApp, db) {
@@ -375,10 +376,11 @@ IMPORTANT ownership rules:
     }
   });
 
-  // ── Legacy regex handler (fallback when no API key) ──
+  // ── Legacy regex handler (fallback when no API key or Groq fails) ──
   async function handleLegacyMessage(text, member, say) {
-    const lower = text.toLowerCase();
+    const lower = text.toLowerCase().trim();
 
+    // ── List tasks ──
     if (lower.match(/^(my\s+)?tasks$|^show\s+(my\s+)?tasks$|^what.*(do|doing|work)/)) {
       const tasks = await db.all(
         `SELECT * FROM tasks WHERE member_id = ? AND status != 'done' ORDER BY
@@ -386,62 +388,127 @@ IMPORTANT ownership rules:
         [member.id]
       );
       if (!tasks.length) {
-        await say("You have no active tasks. Send me a task name to create one!");
+        await say("You have no active tasks. Send me `create <task name>` to add one!");
         return;
       }
-      const lines = tasks.map(t => {
-        const emoji = { todo: ':white_circle:', in_progress: ':arrow_forward:', review: ':eyes:' }[t.status];
-        return `${emoji} *${t.title}* — _${statusLabel(t.status)}_`;
+      const lines = tasks.map((t, i) => {
+        const emoji = { todo: ':white_circle:', in_progress: ':arrow_forward:', review: ':eyes:' }[t.status] || ':white_circle:';
+        return `${emoji} *${i + 1}. ${t.title}* — _${statusLabel(t.status)}_`;
       });
-      await say(`*Your Active Tasks (${tasks.length}):*\n\n${lines.join('\n')}\n\n_Reply with a task number action like "1 done" or "2 in progress" to update._`);
+      await say(`*Your Active Tasks (${tasks.length}):*\n\n${lines.join('\n')}\n\n_Say "task name is done", "1 done", or "start task name" to update._`);
       return;
     }
 
-    if (lower.match(/^(\d+)\s+(done|complete|finished|finish)$/)) {
-      const idx = parseInt(lower.match(/^(\d+)/)[1]) - 1;
+    // ── Helper: find task by numbered index or fuzzy name match ──
+    async function findTask(query) {
       const tasks = await db.all(
         `SELECT * FROM tasks WHERE member_id = ? AND status != 'done' ORDER BY
          CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END`,
         [member.id]
       );
-      if (idx >= 0 && idx < tasks.length) {
-        const task = tasks[idx];
+      // numbered: "1", "2", ...
+      const numMatch = query.match(/^(\d+)$/);
+      if (numMatch) {
+        const idx = parseInt(numMatch[1]) - 1;
+        return idx >= 0 && idx < tasks.length ? tasks[idx] : null;
+      }
+      // exact title match (case-insensitive)
+      const q = query.toLowerCase();
+      return tasks.find(t => t.title.toLowerCase() === q) ||
+             tasks.find(t => t.title.toLowerCase().includes(q)) ||
+             null;
+    }
+
+    // ── Mark done: "X is done", "X done", "finished X", "complete X", "1 done" ──
+    const doneMatch = lower.match(/^(.+?)\s+(?:is\s+)?(?:done|complete|finished|finish)$/) ||
+                      lower.match(/^(?:done|complete|finished|finish)\s+(.+)$/) ||
+                      lower.match(/^(\d+)\s+(?:done|complete|finished|finish)$/);
+    if (doneMatch) {
+      const query = doneMatch[1].trim();
+      const task = await findTask(query);
+      if (task) {
         await db.run('UPDATE tasks SET status = ?, completed_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
           ['done', new Date().toISOString(), task.id]);
         await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
           [task.id, member.id, 'status_change', `Status: ${task.status} → done (via DM)`]);
-        await say(`Done! Marked *${task.title}* as complete.`);
+        await say(`:white_check_mark: Marked *${task.title}* as done!`);
       } else {
-        await say("Couldn't find that task. Send *tasks* to see your list.");
+        await say(`Couldn't find a task matching "${query}". Send *tasks* to see your list.`);
       }
       return;
     }
 
+    // ── Move to In Progress: "start X", "X in progress", "working on X", "2 in progress" ──
+    const progressMatch = lower.match(/^(?:start|working on|begin)\s+(.+)$/) ||
+                          lower.match(/^(.+?)\s+in\s+progress$/) ||
+                          lower.match(/^(\d+)\s+(?:in\s+progress|start|working)/);
+    if (progressMatch) {
+      const query = (progressMatch[1] || '').trim();
+      const task = await findTask(query);
+      if (task) {
+        await db.run('UPDATE tasks SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', ['in_progress', task.id]);
+        await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
+          [task.id, member.id, 'status_change', `Status: ${task.status} → in_progress (via DM)`]);
+        await say(`:arrow_forward: Moved *${task.title}* to In Progress!`);
+      } else {
+        await say(`Couldn't find a task matching "${query}". Send *tasks* to see your list.`);
+      }
+      return;
+    }
+
+    // ── Move to Review: "review X", "X in review" ──
+    const reviewMatch = lower.match(/^(?:review)\s+(.+)$/) ||
+                        lower.match(/^(.+?)\s+(?:in\s+)?review$/) ||
+                        lower.match(/^(\d+)\s+review/);
+    if (reviewMatch) {
+      const query = (reviewMatch[1] || '').trim();
+      const task = await findTask(query);
+      if (task) {
+        await db.run('UPDATE tasks SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?', ['review', task.id]);
+        await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
+          [task.id, member.id, 'status_change', `Status: ${task.status} → review (via DM)`]);
+        await say(`:eyes: Moved *${task.title}* to Review!`);
+      } else {
+        await say(`Couldn't find a task matching "${query}". Send *tasks* to see your list.`);
+      }
+      return;
+    }
+
+    // ── Help ──
     if (lower === 'help') {
-      await say(`*How to use the Winning Circle Bot:*\n\n` +
-        `Send me any of these:\n` +
+      await say(
+        `*Winning Circle Bot commands:*\n\n` +
         `• *tasks* — see your active tasks\n` +
-        `• *1 done* — mark task #1 as done\n` +
-        `• *2 in progress* — move task #2 to In Progress\n` +
-        `• Any text — creates a new task for you\n` +
-        `\nOr use slash commands: \`/tasks\`, \`/newtask\`, \`/update\``
+        `• *task name is done* — mark a task done by name\n` +
+        `• *1 done* — mark task #1 done by number\n` +
+        `• *start task name* — move to In Progress\n` +
+        `• *review task name* — move to Review\n` +
+        `• *create <task name>* — create a new task\n` +
+        `\nSlash commands: \`/tasks\`, \`/newtask\`, \`/update\``
       );
       return;
     }
 
-    // Only create tasks when explicitly requested (e.g., "create task fix the bug" or "new task deploy v2")
+    // ── Create task explicitly ──
     const createMatch = lower.match(/^(?:create|new|add)\s+(?:a\s+)?(?:task\s+)?(.+)/);
     if (createMatch && createMatch[1].length > 1 && createMatch[1].length < 200) {
-      const title = createMatch[1].trim();
+      const title = text.replace(/^(?:create|new|add)\s+(?:a\s+)?(?:task\s+)?/i, '').trim();
       const info = await db.run('INSERT INTO tasks (title, status, member_id) VALUES (?, ?, ?)',
         [title, 'todo', member.id]);
       await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
         [info.lastInsertRowid, member.id, 'created', `Task "${title}" created via DM`]);
-      await say(`Created task: *${title}* (To Do)\n_Send "tasks" to see your list._`);
+      await say(`:white_circle: Created task: *${title}*\n_Send *tasks* to see your list._`);
       return;
     }
 
-    await say(`I didn't understand that. Try:\n• *tasks* — see your task list\n• *1 done* — mark task #1 as done\n• *create <task name>* — create a new task\n• *help* — see all commands`);
+    await say(
+      `I didn't understand that. Try:\n` +
+      `• *tasks* — see your task list\n` +
+      `• *task name is done* — mark a task as done\n` +
+      `• *1 done* — mark task #1 as done\n` +
+      `• *create <task name>* — create a new task\n` +
+      `• *help* — see all commands`
+    );
   }
 
   // ─────────── /tasks — View your tasks ───────────
