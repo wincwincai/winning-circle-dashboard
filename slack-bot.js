@@ -51,6 +51,30 @@ function initSlackBot(expressApp, db) {
 
   const CHANNEL_ID = process.env.SLACK_CHANNEL_ID || '';
   const REMINDER_CRON = process.env.REMINDER_CRON || '0 9 * * 1-5';
+  const PUBLIC_BASE_URL = process.env.BASE_URL || '';
+
+  // DM the reviewer when they get assigned to a task. Best-effort — failures
+  // are logged but never thrown, since this fires from a request path that
+  // already returned 200 to the caller.
+  async function dmReviewerOfAssignment(reviewerId, taskId, assignerId) {
+    try {
+      const reviewer = await db.get('SELECT * FROM members WHERE id = ?', [reviewerId]);
+      if (!reviewer || !reviewer.slack_id) return; // reviewer not on Slack — nothing to do
+      const task = await db.get('SELECT * FROM tasks WHERE id = ?', [taskId]);
+      if (!task) return;
+      const assigner = assignerId ? await db.get('SELECT name FROM members WHERE id = ?', [assignerId]) : null;
+      const link = PUBLIC_BASE_URL ? `\n${PUBLIC_BASE_URL}/` : '';
+      const msg = `${assigner?.name || 'A teammate'} asked you to review *${task.title}*. Move it to *Done* on the dashboard once you're happy with it.${link}`;
+      await slackApp.client.chat.postMessage({ channel: reviewer.slack_id, text: msg });
+    } catch (e) {
+      console.error('dmReviewerOfAssignment error:', e.message);
+    }
+  }
+  // Expose to server.js so PUT /api/tasks (etc.) can fire the notification.
+  expressApp.locals.notifyReviewer = (reviewerId, taskId, assignerId) => {
+    // Fire and forget — caller doesn't await.
+    dmReviewerOfAssignment(reviewerId, taskId, assignerId);
+  };
 
   // ─────────── Gemini AI Agent ───────────
   const gemini = process.env.GEMINI_API_KEY
@@ -230,6 +254,21 @@ function initSlackBot(expressApp, db) {
         description: 'List all team members with their IDs and task counts.',
         parameters: { type: 'object', properties: {} }
       }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'assign_reviewer',
+        description: 'Assign a teammate to review one of the current user\'s tasks. Moves the task to "review" status and DMs the reviewer in Slack. Use list_team_members first if you need to look up the reviewer\'s member_id by name.',
+        parameters: {
+          type: 'object',
+          properties: {
+            task_id: { type: 'integer', description: 'The task to send for review.' },
+            reviewer_member_id: { type: 'integer', description: 'The dashboard member_id of the reviewer.' }
+          },
+          required: ['task_id', 'reviewer_member_id']
+        }
+      }
     }
   ];
 
@@ -286,7 +325,21 @@ function initSlackBot(expressApp, db) {
       case 'update_task': {
         const existing = await db.get('SELECT * FROM tasks WHERE id = ?', [input.task_id]);
         if (!existing) return JSON.stringify({ error: 'Task not found' });
-        if (existing.member_id !== member.id) return JSON.stringify({ error: 'You can only update your own tasks.' });
+
+        const isAssignee = existing.member_id === member.id;
+        const isReviewer = existing.reviewer_id === member.id;
+        const isAdmin = member.is_admin === 1;
+        const onlyStatus = Object.keys(input).every(k => k === 'task_id' || k === 'status');
+        const reviewerOk = isReviewer && existing.status === 'review' && onlyStatus;
+        if (!isAssignee && !isAdmin && !reviewerOk) {
+          return JSON.stringify({ error: 'You can only update your own tasks. Reviewers can only change status while a task is in review.' });
+        }
+
+        // Moving review→done requires assignee, reviewer, or admin
+        if (existing.status === 'review' && input.status === 'done' &&
+            !isAssignee && !isReviewer && !isAdmin) {
+          return JSON.stringify({ error: 'Only the assignee, the assigned reviewer, or an admin can mark a review as done.' });
+        }
 
         const newStatus = input.status || existing.status;
         const completedAt = newStatus === 'done' && existing.status !== 'done'
@@ -308,13 +361,42 @@ function initSlackBot(expressApp, db) {
         if (input.status && input.status !== existing.status) {
           await db.run(
             'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
-            [input.task_id, existing.member_id, 'status_change',
+            [input.task_id, member.id, 'status_change',
              `Status: ${existing.status} → ${input.status} (via Slack agent)`]
           );
         }
 
         const updated = await db.get('SELECT * FROM tasks WHERE id = ?', [input.task_id]);
         return JSON.stringify(updated);
+      }
+
+      case 'assign_reviewer': {
+        const existing = await db.get('SELECT * FROM tasks WHERE id = ?', [input.task_id]);
+        if (!existing) return JSON.stringify({ error: 'Task not found' });
+        if (existing.member_id !== member.id && member.is_admin !== 1) {
+          return JSON.stringify({ error: 'You can only assign reviewers to your own tasks.' });
+        }
+        const reviewerId = parseInt(input.reviewer_member_id, 10);
+        if (!reviewerId) return JSON.stringify({ error: 'reviewer_member_id is required.' });
+        if (reviewerId === member.id) return JSON.stringify({ error: 'You can\'t set yourself as the reviewer.' });
+        const reviewer = await db.get('SELECT * FROM members WHERE id = ?', [reviewerId]);
+        if (!reviewer) return JSON.stringify({ error: 'Reviewer not found. Use list_team_members to find their member_id.' });
+
+        await db.run(
+          `UPDATE tasks SET reviewer_id = ?, status = 'review', updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+          [reviewerId, input.task_id]
+        );
+        await db.run(
+          'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
+          [input.task_id, member.id, 'reviewer_assigned',
+           `Reviewer set to ${reviewer.name}; status → review (via Slack agent)`]
+        );
+
+        // Fire DM (no await — best-effort)
+        dmReviewerOfAssignment(reviewerId, input.task_id, member.id);
+
+        const updated = await db.get('SELECT * FROM tasks WHERE id = ?', [input.task_id]);
+        return JSON.stringify({ ...updated, reviewer_name: reviewer.name, _notice: `Sent for review by ${reviewer.name}.` });
       }
 
       case 'delete_task': {
@@ -352,11 +434,11 @@ function initSlackBot(expressApp, db) {
       }
 
       case 'list_team_members': {
-        if (member.is_admin !== 1) {
-          return JSON.stringify({ error: 'list_team_members is admin-only.' });
-        }
+        // Read-only directory used to look up member_ids for reviewer
+        // assignment etc. Same data as the public /api/members endpoint.
         const members = await db.all(`
-          SELECT m.*, COUNT(t.id) as task_count,
+          SELECT m.id, m.name, m.avatar_color,
+            COUNT(t.id) as task_count,
             SUM(CASE WHEN t.status != 'done' THEN 1 ELSE 0 END) as active_tasks
           FROM members m LEFT JOIN tasks t ON m.id = t.member_id
           GROUP BY m.id ORDER BY m.name`);
@@ -383,7 +465,7 @@ CRITICAL INSTRUCTIONS — follow these strictly:
 3. "create X", "new task X", "add X", or any text that looks like a task to create → call create_task with the title
 4. "X is done", "finished X", "complete X", "mark X as done" → FIRST call list_tasks to find the task, THEN call update_task with status "done"
 5. "X in progress", "working on X", "start X", "move X to in progress" → FIRST call list_tasks to find the task, THEN call update_task with status "in_progress"
-6. "X in review", "review X" → FIRST call list_tasks, THEN call update_task with status "review"
+6. "X in review", "review X", "I need a review for X", "<person> should review X" → call assign_reviewer with the task_id and the reviewer's member_id (use list_team_members first if you need to look up the reviewer by name). Match the reviewer's name fuzzily — case- and accent-insensitive substring is fine.
 7. "delete X", "remove X" → FIRST call list_tasks to find the task ID, THEN call delete_task
 8. "stats", "team stats", "how's the team" → call get_team_stats
 9. "standup", "daily update" → call submit_daily_update
@@ -405,9 +487,10 @@ Available tools:
 - update_task_status(task_id, status) — set status to one of todo / in_progress / done
 - update_task — full update (title, description, priority, due_date, status)
 - delete_task(task_id) — permanently remove a task. ALWAYS ask the user to confirm before calling delete_task. Never delete without explicit confirmation in the conversation.
+- assign_reviewer(task_id, reviewer_member_id) — set a reviewer on one of YOUR tasks and move it to "review". The reviewer gets DM'd. Look up the reviewer with list_team_members if needed.
 - add_daily_update(done_summary, plan_summary?, blockers?) — submit today's standup
 - get_team_stats — read-only team overview
-- list_team_members — admin only
+- list_team_members — read-only; lists everyone's name + member_id (used to look up reviewers)
 
 Always scope every action to the current user. If a tool returns an error about not being linked, instruct the user to register on the dashboard first.`;
 

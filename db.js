@@ -191,6 +191,15 @@ async function initDatabase() {
     }
   }
 
+  // Migration: add reviewer_id column to tasks (co-task / review-handoff feature)
+  try {
+    await _db.run('ALTER TABLE tasks ADD COLUMN reviewer_id INTEGER REFERENCES members(id)');
+  } catch (e) {
+    if (!/duplicate column|already exists/i.test(e.message || '')) {
+      console.error('Migration reviewer_id error:', e.message);
+    }
+  }
+
   // Migration: ensure unique index on members.name for older DBs
   try {
     await _db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_members_name_unique ON members(name)');

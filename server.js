@@ -44,9 +44,29 @@ const TITLE_MAX = 200;
 const TEXT_MAX = 5000;
 const ALLOWED_STATUS = ['todo', 'in_progress', 'review', 'done'];
 const ALLOWED_PRIORITY = ['low', 'medium', 'high', 'urgent'];
+// Done tasks completed more than this many days ago are hidden from the
+// main /api/tasks board response. They remain visible on /api/tasks/archive.
+const DONE_HIDE_DAYS = parseInt(process.env.DASHBOARD_DONE_HIDE_DAYS, 10) || 7;
+
+// Standard SELECT used everywhere we return a task — joins assignee + reviewer
+// rows so the client always has names/colors for both.
+const TASK_SELECT = `
+  SELECT t.*,
+    m.name  AS member_name,   m.avatar_color  AS avatar_color,
+    rv.name AS reviewer_name, rv.avatar_color AS reviewer_avatar_color
+  FROM tasks t
+  LEFT JOIN members m  ON t.member_id   = m.id
+  LEFT JOIN members rv ON t.reviewer_id = rv.id
+`;
 
 function isStr(v) { return typeof v === 'string'; }
 function isOptStr(v) { return v === undefined || v === null || typeof v === 'string'; }
+function isPosInt(v) { return Number.isInteger(v) && v > 0; }
+function toIntOrNull(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
 
 // ---------------------------------------------------------------------------
 // Middleware (skip JSON body parsing for /slack/ — Bolt handles its own)
@@ -255,6 +275,10 @@ app.get('/admin', requireAuth, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'admin.html'));
 });
 
+app.get('/archive', requireAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'archive.html'));
+});
+
 // ---------------------------------------------------------------------------
 // Protect all /api/* routes
 // ---------------------------------------------------------------------------
@@ -336,8 +360,7 @@ app.delete('/api/admin/members/:id', requireAuth, requireAdmin, wrap(async (req,
 app.get('/api/admin/tasks', requireAuth, requireAdmin, wrap(async (req, res) => {
   const db = getDB();
   const { status, member_id } = req.query;
-  let sql = `SELECT t.*, m.name as member_name, m.avatar_color
-             FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE 1=1`;
+  let sql = TASK_SELECT + ' WHERE 1=1';
   const params = [];
   if (status)    { sql += ' AND t.status = ?';    params.push(status); }
   if (member_id) { sql += ' AND t.member_id = ?'; params.push(parseInt(member_id)); }
@@ -365,9 +388,7 @@ app.put('/api/admin/tasks/:id', requireAuth, requireAdmin, wrap(async (req, res)
     await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
       [taskId, existing.member_id, 'status_change', `Status: ${existing.status} → ${status} (admin)`]);
   }
-  res.json(await db.get(
-    'SELECT t.*, m.name as member_name, m.avatar_color FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE t.id = ?',
-    [taskId]));
+  res.json(await db.get(TASK_SELECT + ' WHERE t.id = ?', [taskId]));
 }));
 
 app.delete('/api/admin/tasks/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
@@ -422,19 +443,68 @@ app.delete('/api/members/:id', requireAdmin, wrap(async (req, res) => {
 // ---------------------------------------------------------------------------
 app.get('/api/tasks', wrap(async (req, res) => {
   const db = getDB();
-  const { status, member_id } = req.query;
-  let sql = `SELECT t.*, m.name as member_name, m.avatar_color
-             FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE 1=1`;
+  const { status, member_id, include_archived } = req.query;
+  let sql = TASK_SELECT + ' WHERE 1=1';
   const params = [];
   if (status) { sql += ' AND t.status = ?'; params.push(status); }
   if (member_id) { sql += ' AND t.member_id = ?'; params.push(parseInt(member_id)); }
+  // Hide done tasks older than DONE_HIDE_DAYS unless caller opts in.
+  // Tasks without a completed_at timestamp are kept (legacy data).
+  if (include_archived !== 'true' && include_archived !== '1') {
+    sql += ` AND NOT (t.status = 'done' AND t.completed_at IS NOT NULL
+             AND t.completed_at < datetime('now', ?))`;
+    params.push(`-${DONE_HIDE_DAYS} days`);
+  }
   sql += ` ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, t.updated_at DESC`;
   res.json(await db.all(sql, params));
 }));
 
+// Archive: completed tasks with filters (assignee, date range, free-text search).
+// Supports CSV export via ?format=csv.
+app.get('/api/tasks/archive', wrap(async (req, res) => {
+  const db = getDB();
+  const { member_id, date_from, date_to, q, format } = req.query;
+  let sql = TASK_SELECT + " WHERE t.status = 'done'";
+  const params = [];
+  if (member_id) { sql += ' AND t.member_id = ?'; params.push(parseInt(member_id)); }
+  if (date_from && /^\d{4}-\d{2}-\d{2}$/.test(date_from)) {
+    sql += ' AND t.completed_at >= ?'; params.push(date_from);
+  }
+  if (date_to && /^\d{4}-\d{2}-\d{2}$/.test(date_to)) {
+    // make end-date inclusive — completed_at < (date_to + 1 day)
+    sql += " AND t.completed_at < datetime(?, '+1 day')"; params.push(date_to);
+  }
+  if (q && typeof q === 'string' && q.trim()) {
+    sql += ' AND (t.title LIKE ? OR t.description LIKE ?)';
+    const like = `%${q.trim()}%`;
+    params.push(like, like);
+  }
+  sql += ' ORDER BY t.completed_at DESC';
+  const rows = await db.all(sql, params);
+
+  if (format === 'csv') {
+    const escape = v => {
+      if (v === null || v === undefined) return '';
+      const s = String(v).replace(/"/g, '""');
+      return /[",\n\r]/.test(s) ? `"${s}"` : s;
+    };
+    const header = ['id', 'title', 'description', 'priority', 'assignee', 'reviewer', 'completed_at', 'created_at'].join(',');
+    const lines = rows.map(r => [
+      r.id, r.title, r.description, r.priority,
+      r.member_name || '', r.reviewer_name || '',
+      r.completed_at || '', r.created_at || ''
+    ].map(escape).join(','));
+    const csv = [header, ...lines].join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="archive-${new Date().toISOString().split('T')[0]}.csv"`);
+    return res.send(csv);
+  }
+  res.json(rows);
+}));
+
 app.post('/api/tasks', wrap(async (req, res) => {
   const db = getDB();
-  const { title, description, status, priority, due_date } = req.body || {};
+  const { title, description, status, priority, due_date, reviewer_id } = req.body || {};
   if (!isStr(title) || !title.trim()) return res.status(400).json({ error: 'Title is required' });
   if (title.length > TITLE_MAX) return res.status(400).json({ error: `Title must be <= ${TITLE_MAX} chars` });
   if (description !== undefined && description !== null) {
@@ -450,20 +520,41 @@ app.post('/api/tasks', wrap(async (req, res) => {
   if (due_date !== undefined && due_date !== null && !isStr(due_date)) {
     return res.status(400).json({ error: 'Invalid due_date' });
   }
+  const reviewerIdInt = toIntOrNull(reviewer_id);
+  if (reviewer_id !== undefined && reviewer_id !== null && reviewer_id !== '' && reviewerIdInt === null) {
+    return res.status(400).json({ error: 'Invalid reviewer_id' });
+  }
+  if (reviewerIdInt !== null) {
+    const exists = await db.get('SELECT id FROM members WHERE id = ?', [reviewerIdInt]);
+    if (!exists) return res.status(400).json({ error: 'Reviewer not found' });
+  }
+  // Creating directly into review status requires a reviewer
+  if (status === 'review' && reviewerIdInt === null) {
+    return res.status(400).json({ error: 'A reviewer is required when status is "review".' });
+  }
   const memberId = req.user.member_id;
   const info = await db.run(
-    'INSERT INTO tasks (title, description, status, priority, member_id, due_date) VALUES (?, ?, ?, ?, ?, ?)',
-    [title, description || '', status || 'todo', priority || 'medium', memberId, due_date || null]
+    'INSERT INTO tasks (title, description, status, priority, member_id, due_date, reviewer_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [title, description || '', status || 'todo', priority || 'medium', memberId, due_date || null, reviewerIdInt]
   );
   await db.run(
     'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
     [info.lastInsertRowid, memberId, 'created', `Task "${title}" created`]
   );
-  res.status(201).json(await db.get(
-    'SELECT t.*, m.name as member_name, m.avatar_color FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE t.id = ?',
-    [info.lastInsertRowid]
-  ));
+  if (reviewerIdInt) notifyReviewer(reviewerIdInt, info.lastInsertRowid, memberId);
+  res.status(201).json(await db.get(TASK_SELECT + ' WHERE t.id = ?', [info.lastInsertRowid]));
 }));
+
+// Hook the Slack bot can populate to DM the reviewer when assigned.
+// No-op until slack-bot.js wires it via app.locals.notifyReviewer.
+function notifyReviewer(reviewerId, taskId, assignerId) {
+  try {
+    const fn = app.locals.notifyReviewer;
+    if (typeof fn === 'function') fn(reviewerId, taskId, assignerId);
+  } catch (e) {
+    console.error('notifyReviewer error:', e.message);
+  }
+}
 
 app.put('/api/tasks/:id', wrap(async (req, res) => {
   const db = getDB();
@@ -471,12 +562,23 @@ app.put('/api/tasks/:id', wrap(async (req, res) => {
   const existing = await db.get('SELECT * FROM tasks WHERE id = ?', [taskId]);
   if (!existing) return res.status(404).json({ error: 'Task not found' });
 
-  // Ownership check: can only edit your own tasks
-  if (existing.member_id !== req.user.member_id) {
+  const userId  = req.user.member_id;
+  const isAdmin = !!req.user.is_admin;
+  const isAssignee = existing.member_id === userId;
+  const isReviewer = existing.reviewer_id === userId;
+
+  // Permission gate:
+  // - Assignee can edit their own task (any field)
+  // - Admin can edit anything
+  // - Reviewer can ONLY change status while the task is currently in 'review'
+  //   (their job is to approve/reject — not edit content)
+  const onlyStatusChange = Object.keys(req.body || {}).every(k => k === 'status');
+  const reviewerOk = isReviewer && existing.status === 'review' && onlyStatusChange;
+  if (!isAssignee && !isAdmin && !reviewerOk) {
     return res.status(403).json({ error: 'You can only edit your own tasks.' });
   }
 
-  const { title, description, status, priority, due_date } = req.body || {};
+  const { title, description, status, priority, due_date, reviewer_id } = req.body || {};
   if (title !== undefined && title !== null) {
     if (!isStr(title) || !title.trim()) return res.status(400).json({ error: 'Invalid title' });
     if (title.length > TITLE_MAX) return res.status(400).json({ error: `Title must be <= ${TITLE_MAX} chars` });
@@ -494,7 +596,36 @@ app.put('/api/tasks/:id', wrap(async (req, res) => {
   if (due_date !== undefined && due_date !== null && !isStr(due_date)) {
     return res.status(400).json({ error: 'Invalid due_date' });
   }
+
+  // reviewer_id handling — accept null/empty to clear, integer to set
+  let reviewerIdProvided = reviewer_id !== undefined;
+  let reviewerIdNew = existing.reviewer_id;
+  if (reviewerIdProvided) {
+    if (reviewer_id === null || reviewer_id === '') {
+      reviewerIdNew = null;
+    } else {
+      const r = toIntOrNull(reviewer_id);
+      if (r === null) return res.status(400).json({ error: 'Invalid reviewer_id' });
+      const exists = await db.get('SELECT id FROM members WHERE id = ?', [r]);
+      if (!exists) return res.status(400).json({ error: 'Reviewer not found' });
+      reviewerIdNew = r;
+    }
+  }
+
   const newStatus = status || existing.status;
+
+  // Status transition rules
+  if (newStatus === 'review' && !reviewerIdNew) {
+    return res.status(400).json({ error: 'A reviewer is required when status is "review".' });
+  }
+  // Moving from review→done: only assignee, the assigned reviewer, or admin
+  if (existing.status === 'review' && newStatus === 'done') {
+    const allowed = isAssignee || isReviewer || isAdmin;
+    if (!allowed) {
+      return res.status(403).json({ error: 'Only the assignee, the assigned reviewer, or an admin can mark a review as done.' });
+    }
+  }
+
   const completedAt = newStatus === 'done' && existing.status !== 'done'
     ? new Date().toISOString() : existing.completed_at;
 
@@ -504,24 +635,26 @@ app.put('/api/tasks/:id', wrap(async (req, res) => {
     status = COALESCE(?, status),
     priority = COALESCE(?, priority),
     due_date = COALESCE(?, due_date),
+    reviewer_id = ?,
     completed_at = ?,
     updated_at = CURRENT_TIMESTAMP
     WHERE id = ?`,
     [title || null, description || null, status || null, priority || null,
-    due_date || null, completedAt, taskId]
+     due_date || null, reviewerIdNew, completedAt, taskId]
   );
 
   if (status && status !== existing.status) {
     await db.run(
       'INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
-      [taskId, existing.member_id, 'status_change', `Status: ${existing.status} → ${status}`]
+      [taskId, userId, 'status_change', `Status: ${existing.status} → ${status}`]
     );
   }
+  // DM the reviewer if newly assigned (not on no-op re-assignments)
+  if (reviewerIdProvided && reviewerIdNew && reviewerIdNew !== existing.reviewer_id) {
+    notifyReviewer(reviewerIdNew, taskId, userId);
+  }
 
-  res.json(await db.get(
-    'SELECT t.*, m.name as member_name, m.avatar_color FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE t.id = ?',
-    [taskId]
-  ));
+  res.json(await db.get(TASK_SELECT + ' WHERE t.id = ?', [taskId]));
 }));
 
 app.delete('/api/tasks/:id', wrap(async (req, res) => {
