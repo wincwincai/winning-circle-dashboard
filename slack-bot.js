@@ -1,15 +1,41 @@
 /**
  * Slack Bot Integration for Winning Circle Dashboard
  *
- * AI-powered task management agent using Groq (Llama).
+ * AI-powered task management agent using Google Gemini.
  * Team members DM the bot naturally and the LLM handles everything
  * via tool use — creating, updating, listing, and managing tasks.
  */
 
 const { App, ExpressReceiver } = require('@slack/bolt');
-const GroqModule = require('groq-sdk');
-const Groq = GroqModule.default || GroqModule;
+const { GoogleGenAI } = require('@google/genai');
 const cron = require('node-cron');
+
+// Convert OpenAI-style JSON Schema (lowercase types) to Gemini's
+// function-declaration schema (uppercase type names). Recursive — covers
+// nested object/array shapes.
+function toGeminiSchema(s) {
+  if (!s || typeof s !== 'object') return s;
+  const out = { ...s };
+  if (typeof out.type === 'string') {
+    const map = { string: 'STRING', integer: 'INTEGER', number: 'NUMBER', boolean: 'BOOLEAN', object: 'OBJECT', array: 'ARRAY' };
+    out.type = map[out.type.toLowerCase()] || out.type.toUpperCase();
+  }
+  if (out.properties && typeof out.properties === 'object') {
+    out.properties = Object.fromEntries(
+      Object.entries(out.properties).map(([k, v]) => [k, toGeminiSchema(v)])
+    );
+  }
+  if (out.items) out.items = toGeminiSchema(out.items);
+  return out;
+}
+
+function toGeminiFunctionDeclarations(openaiTools) {
+  return openaiTools.map(t => ({
+    name: t.function.name,
+    description: t.function.description,
+    parameters: toGeminiSchema(t.function.parameters || { type: 'object', properties: {} }),
+  }));
+}
 
 function initSlackBot(expressApp, db) {
   const receiver = new ExpressReceiver({
@@ -26,10 +52,11 @@ function initSlackBot(expressApp, db) {
   const CHANNEL_ID = process.env.SLACK_CHANNEL_ID || '';
   const REMINDER_CRON = process.env.REMINDER_CRON || '0 9 * * 1-5';
 
-  // ─────────── Groq AI Agent ───────────
-  const groq = process.env.GROQ_API_KEY
-    ? new Groq({ apiKey: process.env.GROQ_API_KEY })
+  // ─────────── Gemini AI Agent ───────────
+  const gemini = process.env.GEMINI_API_KEY
+    ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
     : null;
+  const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
   const TOOLS = [
     {
@@ -308,7 +335,7 @@ function initSlackBot(expressApp, db) {
     }
   }
 
-  // ── Run Groq agent loop (call tools until done) ──
+  // ── Run Gemini agent loop (call tools until done) ──
   async function runAgent(userMessage, member) {
     const today = new Date().toISOString().split('T')[0];
 
@@ -351,67 +378,70 @@ Available tools:
 
 Always scope every action to the current user. If a tool returns an error about not being linked, instruct the user to register on the dashboard first.`;
 
-    let messages = [{ role: 'user', content: userMessage }];
+    const functionDeclarations = toGeminiFunctionDeclarations(TOOLS);
+    const contents = [{ role: 'user', parts: [{ text: userMessage }] }];
 
     // Agent loop — keep calling tools until LLM gives a final text response
     for (let i = 0; i < 5; i++) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 30000);
       let response;
       try {
-        response = await groq.chat.completions.create({
-          model: 'llama-3.3-70b-versatile',
-          messages: [{ role: 'system', content: systemPrompt }, ...messages],
-          tools: TOOLS,
-          tool_choice: 'auto',
-          temperature: 0,
-          max_tokens: 1024,
-        }, { signal: controller.signal });
+        response = await Promise.race([
+          gemini.models.generateContent({
+            model: GEMINI_MODEL,
+            contents,
+            config: {
+              systemInstruction: systemPrompt,
+              tools: [{ functionDeclarations }],
+              temperature: 0,
+              maxOutputTokens: 1024,
+            },
+          }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('GEMINI_TIMEOUT')), 30000)),
+        ]);
       } catch (err) {
-        clearTimeout(timeout);
-        if (err.name === 'AbortError' || controller.signal.aborted) {
+        if (err && err.message === 'GEMINI_TIMEOUT') {
           return "The AI took too long to respond — please try again.";
         }
         throw err;
       }
-      clearTimeout(timeout);
 
-      const choice = response.choices?.[0];
-      if (!choice) return "Something went wrong — try again.";
+      const candidate = response.candidates?.[0];
+      const parts = candidate?.content?.parts || [];
+      if (parts.length === 0) return "Something went wrong — try again.";
 
-      const msg = choice.message;
-      messages.push(msg);
+      const functionCalls = parts
+        .filter(p => p.functionCall)
+        .map(p => ({ name: p.functionCall.name, args: p.functionCall.args || {} }));
 
-      // If no tool calls, return the text
-      if (!msg.tool_calls || msg.tool_calls.length === 0) {
-        return msg.content || 'Done!';
+      // No tool calls → return the model's text reply
+      if (functionCalls.length === 0) {
+        const text = parts.filter(p => p.text).map(p => p.text).join('').trim();
+        return text || 'Done!';
       }
 
-      // Execute each tool call and add results
-      for (const toolCall of msg.tool_calls) {
-        let args;
+      // Record the model's tool-call turn in conversation history
+      contents.push({ role: 'model', parts });
+
+      // Execute each call and append a single 'user' turn carrying all responses
+      const responseParts = [];
+      for (const fc of functionCalls) {
+        let resultStr;
         try {
-          args = JSON.parse(toolCall.function.arguments || '{}') || {};
-        } catch (parseErr) {
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            content: JSON.stringify({ error: `Invalid JSON in tool arguments: ${parseErr.message}. Please retry with valid JSON.` }),
-          });
-          continue;
-        }
-        let result;
-        try {
-          result = await executeTool(toolCall.function.name, args, member);
+          resultStr = await executeTool(fc.name, fc.args, member);
         } catch (toolErr) {
-          result = JSON.stringify({ error: `Tool execution failed: ${toolErr.message}` });
+          resultStr = JSON.stringify({ error: `Tool execution failed: ${toolErr.message}` });
         }
-        messages.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: result,
+        let parsed;
+        try { parsed = JSON.parse(resultStr); } catch (_) { parsed = { result: resultStr }; }
+        // Gemini requires functionResponse.response to be an object, not an array/scalar
+        if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          parsed = { result: parsed };
+        }
+        responseParts.push({
+          functionResponse: { name: fc.name, response: parsed },
         });
       }
+      contents.push({ role: 'user', parts: responseParts });
     }
 
     return "I got a bit stuck — try rephrasing your request.";
@@ -465,8 +495,8 @@ Always scope every action to the current user. If a tool returns an error about 
     const text = (message.text || '').trim();
     if (!text || text.length > 2000) return;
 
-    // If Groq is not configured, fall back to simple regex handling
-    if (!groq) {
+    // If Gemini is not configured, fall back to simple regex handling
+    if (!gemini) {
       await handleLegacyMessage(text, member, say);
       return;
     }
@@ -493,7 +523,7 @@ Always scope every action to the current user. If a tool returns an error about 
     }
   });
 
-  // ── Legacy regex handler (fallback when no API key or Groq fails) ──
+  // ── Legacy regex handler (fallback when no API key or Gemini fails) ──
   async function handleLegacyMessage(text, member, say) {
     const lower = text.toLowerCase().trim();
 
