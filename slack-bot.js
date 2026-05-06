@@ -57,6 +57,39 @@ function initSlackBot(expressApp, db) {
     ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
     : null;
   const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  // Fallback model used when the primary returns 503/UNAVAILABLE after retries.
+  // Different model = different capacity pool, often clears the overload.
+  const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.0-flash';
+
+  // Call generateContent with exponential-backoff retries on transient errors
+  // (503 UNAVAILABLE, 429 RESOURCE_EXHAUSTED, 500). On final failure with the
+  // primary model, swap to the fallback model and try once more.
+  async function generateWithRetry(params) {
+    const transientCodes = new Set([429, 500, 503]);
+    const isTransient = (e) => {
+      const msg = String(e?.message || '');
+      const code = e?.status || e?.code;
+      if (transientCodes.has(Number(code))) return true;
+      return /503|UNAVAILABLE|overload|RESOURCE_EXHAUSTED|429|rate.?limit/i.test(msg);
+    };
+
+    const delays = [400, 1200, 3000]; // ms — total ~4.6s of backoff
+    let lastErr;
+    for (const model of [params.model, GEMINI_FALLBACK_MODEL]) {
+      for (let attempt = 0; attempt <= delays.length; attempt++) {
+        try {
+          return await gemini.models.generateContent({ ...params, model });
+        } catch (err) {
+          lastErr = err;
+          if (!isTransient(err) || attempt === delays.length) break;
+          await new Promise(r => setTimeout(r, delays[attempt]));
+        }
+      }
+      if (model === GEMINI_FALLBACK_MODEL || !isTransient(lastErr)) break;
+      console.warn(`Gemini primary model ${params.model} unavailable; falling back to ${GEMINI_FALLBACK_MODEL}`);
+    }
+    throw lastErr;
+  }
 
   const TOOLS = [
     {
@@ -386,7 +419,7 @@ Always scope every action to the current user. If a tool returns an error about 
       let response;
       try {
         response = await Promise.race([
-          gemini.models.generateContent({
+          generateWithRetry({
             model: GEMINI_MODEL,
             contents,
             config: {
@@ -396,7 +429,7 @@ Always scope every action to the current user. If a tool returns an error about 
               maxOutputTokens: 1024,
             },
           }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('GEMINI_TIMEOUT')), 30000)),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('GEMINI_TIMEOUT')), 45000)),
         ]);
       } catch (err) {
         if (err && err.message === 'GEMINI_TIMEOUT') {
@@ -505,17 +538,12 @@ Always scope every action to the current user. If a tool returns an error about 
       const response = await runAgent(text, member);
       await say(response);
     } catch (e) {
+      // generateWithRetry already did exponential backoff + model fallback,
+      // so reaching here means Gemini is genuinely down (or the request is
+      // malformed). Drop straight to legacy mode without another retry.
       console.error('Agent error:', e.message, e.stack);
-      // Retry once after a short delay (handles rate limits)
-      try {
-        await new Promise(r => setTimeout(r, 1500));
-        const response = await runAgent(text, member);
-        await say(response);
-      } catch (e2) {
-        console.error('Agent retry failed:', e2.message);
-        await say(`_AI is temporarily unavailable — using basic mode._`);
-        await handleLegacyMessage(text, member, say);
-      }
+      await say(`_AI is temporarily unavailable — using basic mode._`);
+      await handleLegacyMessage(text, member, say);
     }
     } catch (outerErr) {
       console.error('Slack message handler error:', outerErr);
