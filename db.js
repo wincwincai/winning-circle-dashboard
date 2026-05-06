@@ -15,7 +15,7 @@ let _mode = null; // 'turso' or 'local'
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
+    name TEXT NOT NULL UNIQUE,
     slack_id TEXT,
     avatar_color TEXT DEFAULT '#6366f1',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -93,6 +93,7 @@ class LocalDB {
   constructor(sqlDb, dbPath) {
     this.sqlDb = sqlDb;
     this.dbPath = dbPath;
+    this._writeQueue = Promise.resolve();
   }
 
   save() {
@@ -124,17 +125,22 @@ class LocalDB {
   }
 
   async run(sql, params = []) {
-    try {
-      this.sqlDb.run(sql, params);
-      const result = this.sqlDb.exec("SELECT last_insert_rowid() as id");
-      const lastId = result.length > 0 ? result[0].values[0][0] : null;
-      this.save();
-      return { lastInsertRowid: lastId };
-    } catch (e) {
-      console.error('Run error:', sql, e.message);
-      this.save();
-      return { lastInsertRowid: null };
-    }
+    const doWrite = () => {
+      try {
+        this.sqlDb.run(sql, params);
+        const result = this.sqlDb.exec('SELECT last_insert_rowid() as id');
+        const lastId = result.length > 0 ? result[0].values[0][0] : null;
+        this.save();
+        return { lastInsertRowid: lastId };
+      } catch (e) {
+        console.error('Run error:', sql, e.message);
+        this.save();
+        return { lastInsertRowid: null, error: e.message };
+      }
+    };
+    const next = this._writeQueue.then(doWrite);
+    this._writeQueue = next.catch(() => {});
+    return next;
   }
 }
 
@@ -179,7 +185,25 @@ async function initDatabase() {
   // Migration: add is_admin column (safe — ignored if already exists)
   try {
     await _db.run('ALTER TABLE members ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0');
-  } catch (e) { /* column already exists */ }
+  } catch (e) {
+    if (!/duplicate column|already exists/i.test(e.message || '')) {
+      console.error('Migration is_admin error:', e.message);
+    }
+  }
+
+  // Migration: ensure unique index on members.name for older DBs
+  try {
+    await _db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_members_name_unique ON members(name)');
+  } catch (e) {
+    console.error('Migration unique index members.name error:', e.message);
+  }
+
+  // Migration: unique index on members.slack_id (allows multiple NULLs in SQLite)
+  try {
+    await _db.run('CREATE UNIQUE INDEX IF NOT EXISTS idx_members_slack_id_unique ON members(slack_id) WHERE slack_id IS NOT NULL');
+  } catch (e) {
+    console.error('Migration unique index members.slack_id error:', e.message);
+  }
 
   return _db;
 }

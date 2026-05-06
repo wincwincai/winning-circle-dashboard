@@ -234,6 +234,11 @@ body::before {
       <input type="text" id="name" required placeholder="e.g. Alex" autocomplete="name" autofocus>
     </div>
     <div class="form-group">
+      <label for="slackId">Slack Member ID</label>
+      <input type="text" id="slackId" placeholder="e.g. U01ABC23DEF" autocomplete="off" pattern="[UW][A-Z0-9]{7,11}" title="Starts with U or W, 8–12 characters">
+      <p style="font-size:11px;color:var(--text-dim);margin-top:6px;line-height:1.5;">Required for new accounts. In Slack: <strong>Profile → ⋯ → Copy member ID</strong>.</p>
+    </div>
+    <div class="form-group">
       <label for="accessCode">Team Access Code</label>
       <input type="password" id="accessCode" required placeholder="Enter the shared team code">
     </div>
@@ -264,8 +269,9 @@ body::before {
     e.preventDefault();
     const name = document.getElementById('name').value;
     const accessCode = document.getElementById('accessCode').value;
+    const slackId = document.getElementById('slackId').value.trim();
     const btn = document.getElementById('submitBtn');
-    
+
     btn.disabled = true;
     btn.textContent = 'Signing in...';
     document.getElementById('alertError').classList.remove('show');
@@ -274,7 +280,7 @@ body::before {
       const res = await fetch('/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, accessCode })
+        body: JSON.stringify({ name, accessCode, slackId })
       });
       
       const data = await res.json();

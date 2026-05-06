@@ -49,6 +49,50 @@ function initSlackBot(expressApp, db) {
     {
       type: 'function',
       function: {
+        name: 'list_my_tasks',
+        description: 'Alias for list_tasks — list the current user\'s tasks, optionally filtered by status.',
+        parameters: {
+          type: 'object',
+          properties: {
+            status: { type: 'string', enum: ['todo', 'in_progress', 'review', 'done', 'all'] }
+          }
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'update_task_status',
+        description: 'Update only the status of one of the current user\'s tasks. status must be one of todo, in_progress, done.',
+        parameters: {
+          type: 'object',
+          properties: {
+            task_id: { type: 'integer' },
+            status: { type: 'string', enum: ['todo', 'in_progress', 'done'] }
+          },
+          required: ['task_id', 'status']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'add_daily_update',
+        description: 'Submit a daily standup update for the current user. Same as submit_daily_update.',
+        parameters: {
+          type: 'object',
+          properties: {
+            done_summary: { type: 'string' },
+            plan_summary: { type: 'string', description: 'What you plan to work on next.' },
+            blockers: { type: 'string' }
+          },
+          required: ['done_summary']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'create_task',
         description: 'Create a new task for the current user.',
         parameters: {
@@ -131,6 +175,22 @@ function initSlackBot(expressApp, db) {
 
   // ── Tool execution ──
   async function executeTool(name, input, member) {
+    if (!member) {
+      return JSON.stringify({ error: 'No linked member. Please register on the dashboard first, then DM the bot again.' });
+    }
+    if (name === 'list_my_tasks') name = 'list_tasks';
+    if (name === 'add_daily_update') {
+      input = {
+        done_summary: input.done_summary,
+        working_on_summary: input.plan_summary || input.working_on_summary || '',
+        blockers: input.blockers || ''
+      };
+      name = 'submit_daily_update';
+    }
+    if (name === 'update_task_status') {
+      input = { task_id: input.task_id, status: input.status };
+      name = 'update_task';
+    }
     switch (name) {
       case 'list_tasks': {
         // Enforce: can only list your own tasks
@@ -232,6 +292,9 @@ function initSlackBot(expressApp, db) {
       }
 
       case 'list_team_members': {
+        if (member.is_admin !== 1) {
+          return JSON.stringify({ error: 'list_team_members is admin-only.' });
+        }
         const members = await db.all(`
           SELECT m.*, COUNT(t.id) as task_count,
             SUM(CASE WHEN t.status != 'done' THEN 1 ELSE 0 END) as active_tasks
@@ -274,20 +337,44 @@ Formatting:
 
 IMPORTANT ownership rules:
 - Users can ONLY manage their own tasks.
-- They can VIEW team stats but cannot modify other people's tasks.`;
+- They can VIEW team stats but cannot modify other people's tasks.
+
+Available tools:
+- list_my_tasks / list_tasks — show the user's tasks (optional status filter)
+- create_task(title, description?, status?) — create a task; status defaults to "todo"
+- update_task_status(task_id, status) — set status to one of todo / in_progress / done
+- update_task — full update (title, description, priority, due_date, status)
+- delete_task(task_id) — permanently remove a task. ALWAYS ask the user to confirm before calling delete_task. Never delete without explicit confirmation in the conversation.
+- add_daily_update(done_summary, plan_summary?, blockers?) — submit today's standup
+- get_team_stats — read-only team overview
+- list_team_members — admin only
+
+Always scope every action to the current user. If a tool returns an error about not being linked, instruct the user to register on the dashboard first.`;
 
     let messages = [{ role: 'user', content: userMessage }];
 
     // Agent loop — keep calling tools until LLM gives a final text response
     for (let i = 0; i < 5; i++) {
-      const response = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [{ role: 'system', content: systemPrompt }, ...messages],
-        tools: TOOLS,
-        tool_choice: 'auto',
-        temperature: 0,
-        max_tokens: 1024,
-      });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 30000);
+      let response;
+      try {
+        response = await groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages: [{ role: 'system', content: systemPrompt }, ...messages],
+          tools: TOOLS,
+          tool_choice: 'auto',
+          temperature: 0,
+          max_tokens: 1024,
+        }, { signal: controller.signal });
+      } catch (err) {
+        clearTimeout(timeout);
+        if (err.name === 'AbortError' || controller.signal.aborted) {
+          return "The AI took too long to respond — please try again.";
+        }
+        throw err;
+      }
+      clearTimeout(timeout);
 
       const choice = response.choices?.[0];
       if (!choice) return "Something went wrong — try again.";
@@ -302,8 +389,23 @@ IMPORTANT ownership rules:
 
       // Execute each tool call and add results
       for (const toolCall of msg.tool_calls) {
-        const args = JSON.parse(toolCall.function.arguments || '{}') || {};
-        const result = await executeTool(toolCall.function.name, args, member);
+        let args;
+        try {
+          args = JSON.parse(toolCall.function.arguments || '{}') || {};
+        } catch (parseErr) {
+          messages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify({ error: `Invalid JSON in tool arguments: ${parseErr.message}. Please retry with valid JSON.` }),
+          });
+          continue;
+        }
+        let result;
+        try {
+          result = await executeTool(toolCall.function.name, args, member);
+        } catch (toolErr) {
+          result = JSON.stringify({ error: `Tool execution failed: ${toolErr.message}` });
+        }
         messages.push({
           role: 'tool',
           tool_call_id: toolCall.id,
@@ -317,26 +419,37 @@ IMPORTANT ownership rules:
 
   // ─────────── DM Handler — AI-powered task management ───────────
   slackApp.message(async ({ message, say }) => {
+    try {
     if (message.channel_type !== 'im' || message.bot_id) return;
 
     let member = await db.get('SELECT * FROM members WHERE slack_id = ?', [message.user]);
 
-    // Auto-link: if no member found by slack_id, try matching by Slack display name
+    // Auto-link: if no member found by slack_id, try matching by Slack display name.
+    // Security: only link if the matched member has NO slack_id yet. If a different
+    // slack_id is already attached, refuse — an admin must relink to prevent
+    // impersonation via Slack display-name changes.
     if (!member) {
       try {
         const userInfo = await slackApp.client.users.info({ user: message.user });
         const slackName = userInfo.user?.real_name || userInfo.user?.profile?.display_name || '';
         if (slackName) {
-          // Try case-insensitive match against existing members
           const allMembers = await db.all('SELECT * FROM members');
-          member = allMembers.find(m =>
+          const candidate = allMembers.find(m =>
             m.name.localeCompare(slackName, undefined, { sensitivity: 'accent' }) === 0 ||
             m.name.localeCompare(slackName.split(' ')[0], undefined, { sensitivity: 'accent' }) === 0
           );
-          if (member) {
-            // Link this Slack ID to the matched member
-            await db.run('UPDATE members SET slack_id = ? WHERE id = ?', [message.user, member.id]);
-            await say(`Linked you to *${member.name}* on the dashboard. You're all set!`);
+          if (candidate) {
+            if (candidate.slack_id && candidate.slack_id !== message.user) {
+              await say(`A dashboard member named *${candidate.name}* already has a different Slack account linked. For security, I can't auto-link you. Please ask an admin to update the Slack ID on your dashboard profile.`);
+              return;
+            }
+            if (!candidate.slack_id) {
+              await db.run('UPDATE members SET slack_id = ? WHERE id = ?', [message.user, candidate.id]);
+              member = { ...candidate, slack_id: message.user };
+              await say(`Linked you to *${member.name}* on the dashboard. You're all set!`);
+            } else {
+              member = candidate;
+            }
           }
         }
       } catch (e) {
@@ -373,6 +486,10 @@ IMPORTANT ownership rules:
         await say(`_AI is temporarily unavailable — using basic mode._`);
         await handleLegacyMessage(text, member, say);
       }
+    }
+    } catch (outerErr) {
+      console.error('Slack message handler error:', outerErr);
+      try { await say("Sorry — something went wrong handling that message. Please try again."); } catch (_) {}
     }
   });
 
@@ -625,23 +742,44 @@ IMPORTANT ownership rules:
   });
 
   // ─────────── Handle task move dropdown ───────────
-  slackApp.action(/^move_task_/, async ({ action, ack, respond }) => {
+  slackApp.action(/^move_task_/, async ({ action, ack, body, respond }) => {
     await ack();
-    const [taskId, newStatus] = action.selected_option.value.split(':');
-    const task = await db.get('SELECT * FROM tasks WHERE id = ?', [parseInt(taskId)]);
-    if (!task) return;
+    try {
+      const [taskId, newStatus] = action.selected_option.value.split(':');
+      const actorSlackId = body.user?.id;
+      const actor = actorSlackId
+        ? await db.get('SELECT * FROM members WHERE slack_id = ?', [actorSlackId])
+        : null;
+      if (!actor) {
+        await respond({ response_type: 'ephemeral', replace_original: false, text: "You're not linked to a dashboard member, so I can't move tasks for you. Please register on the dashboard first." });
+        return;
+      }
+      const task = await db.get('SELECT * FROM tasks WHERE id = ?', [parseInt(taskId)]);
+      if (!task) {
+        await respond({ response_type: 'ephemeral', replace_original: false, text: "That task no longer exists." });
+        return;
+      }
+      if (task.member_id !== actor.id && actor.is_admin !== 1) {
+        await respond({ response_type: 'ephemeral', replace_original: false, text: "You can only move your own tasks." });
+        return;
+      }
 
-    const completedAt = newStatus === 'done' ? new Date().toISOString() : null;
-    await db.run('UPDATE tasks SET status = ?, completed_at = COALESCE(?, completed_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-      [newStatus, completedAt, parseInt(taskId)]);
-    await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
-      [parseInt(taskId), task.member_id, 'status_change', `Status: ${task.status} → ${newStatus} (via Slack)`]);
-    await respond({ text: `Moved *${task.title}* to ${statusLabel(newStatus)}`, replace_original: false });
+      const completedAt = newStatus === 'done' ? new Date().toISOString() : null;
+      await db.run('UPDATE tasks SET status = ?, completed_at = COALESCE(?, completed_at), updated_at = CURRENT_TIMESTAMP WHERE id = ?',
+        [newStatus, completedAt, parseInt(taskId)]);
+      await db.run('INSERT INTO activity_log (task_id, member_id, action, details) VALUES (?, ?, ?, ?)',
+        [parseInt(taskId), actor.id, 'status_change', `Status: ${task.status} → ${newStatus} (via Slack by ${actor.name})`]);
+      await respond({ text: `Moved *${task.title}* to ${statusLabel(newStatus)}`, replace_original: false });
+    } catch (err) {
+      console.error('move_task action error:', err);
+      try { await respond({ response_type: 'ephemeral', replace_original: false, text: "Something went wrong moving that task." }); } catch (_) {}
+    }
   });
 
   // ─────────── Handle daily update modal ───────────
   slackApp.view('daily_update_modal', async ({ ack, body, view }) => {
     await ack();
+    try {
     const userId = body.user.id;
     const member = await db.get('SELECT * FROM members WHERE slack_id = ?', [userId]);
     if (!member) return;
@@ -661,6 +799,9 @@ IMPORTANT ownership rules:
         text: `Your daily update has been saved!`
       });
     } catch (e) { /* ignore DM errors */ }
+    } catch (err) {
+      console.error('daily_update_modal error:', err);
+    }
   });
 
   // ─────────── Scheduled Reminders ───────────

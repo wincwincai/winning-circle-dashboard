@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Winning Circle — Admin</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1117; --surface: #1a1d27; --surface2: #242836;
+  --border: #2e3348; --text: #e4e7f1; --text-dim: #8b8fa7;
+  --accent: #6366f1; --green: #22c55e; --yellow: #eab308; --red: #ef4444; --blue: #3b82f6;
+  --radius: 10px; --radius-sm: 6px;
+}
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+.header { padding: 20px 24px; border-bottom: 1px solid var(--border); background: var(--surface); display: flex; align-items: center; justify-content: space-between; }
+.header-left { display: flex; align-items: center; gap: 12px; }
+.logo { width: 36px; height: 36px; background: var(--accent); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px; color: #fff; }
+.header h1 { font-size: 18px; font-weight: 600; }
+.badge { background: var(--red); padding: 4px 10px; border-radius: 12px; font-size: 11px; color: #fff; font-weight: 600; }
+.header-right { display: flex; align-items: center; gap: 14px; }
+.nav-link { font-size: 13px; color: var(--text-dim); text-decoration: none; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; transition: all .15s; }
+.nav-link:hover { color: var(--text); border-color: var(--accent); }
+.btn-signout { font-size: 11px; color: var(--text-dim); text-decoration: none; padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px; }
+.btn-signout:hover { border-color: var(--red); color: var(--red); }
+
+.container { padding: 24px; max-width: 1400px; margin: 0 auto; }
+.tabs { display: flex; gap: 8px; margin-bottom: 24px; border-bottom: 1px solid var(--border); }
+.tab { background: none; border: none; color: var(--text-dim); padding: 10px 16px; cursor: pointer; font-size: 13px; font-weight: 500; border-bottom: 2px solid transparent; transition: all .15s; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.section { display: none; }
+.section.active { display: block; }
+.section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.section-title { font-size: 16px; font-weight: 600; }
+.btn { background: var(--accent); color: #fff; border: none; padding: 8px 16px; border-radius: var(--radius-sm); font-size: 13px; font-weight: 500; cursor: pointer; transition: opacity .15s; }
+.btn:hover { opacity: .9; }
+.btn-danger { background: var(--red); }
+.btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text-dim); }
+.btn-ghost:hover { color: var(--text); border-color: var(--accent); }
+.btn-sm { padding: 4px 10px; font-size: 12px; }
+
+table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: var(--radius); overflow: hidden; }
+th { text-align: left; padding: 12px 16px; background: var(--surface2); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+td { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 13px; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: rgba(99,102,241,.04); }
+.actions { display: flex; gap: 6px; justify-content: flex-end; }
+.muted { color: var(--text-dim); }
+.pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
+.pill.admin { background: rgba(99,102,241,.2); color: var(--accent); }
+.pill.todo { background: rgba(59,130,246,.2); color: var(--blue); }
+.pill.in_progress { background: rgba(234,179,8,.2); color: var(--yellow); }
+.pill.review { background: rgba(168,85,247,.2); color: #a855f7; }
+.pill.done { background: rgba(34,197,94,.2); color: var(--green); }
+.avatar { width: 28px; height: 28px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; color: #fff; margin-right: 8px; vertical-align: middle; }
+
+input[type="text"], input[type="checkbox"], select { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 6px 10px; font-size: 13px; font-family: inherit; }
+input[type="text"]:focus, select:focus { outline: none; border-color: var(--accent); }
+.checkbox-cell { display: flex; align-items: center; gap: 6px; }
+
+.empty { text-align: center; padding: 40px; color: var(--text-dim); }
+.error { background: rgba(239,68,68,.1); border: 1px solid var(--red); color: var(--red); padding: 12px 16px; border-radius: var(--radius-sm); margin-bottom: 16px; font-size: 13px; }
+.toast { position: fixed; bottom: 24px; right: 24px; background: var(--surface); border: 1px solid var(--border); padding: 12px 18px; border-radius: var(--radius); font-size: 13px; box-shadow: 0 10px 30px rgba(0,0,0,.4); z-index: 1000; opacity: 0; transform: translateY(10px); transition: all .2s; }
+.toast.show { opacity: 1; transform: translateY(0); }
+.toast.success { border-color: var(--green); }
+.toast.error { border-color: var(--red); }
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="header-left">
+    <div class="logo">WC</div>
+    <h1>Winning Circle</h1>
+    <span class="badge">Admin</span>
+  </div>
+  <div class="header-right">
+    <a href="/" class="nav-link">Dashboard</a>
+    <a href="/board" class="nav-link">Board</a>
+    <a href="/auth/logout" class="btn-signout">Sign out</a>
+  </div>
+</div>
+
+<div class="container">
+  <div id="forbidden" style="display:none" class="error">You must be an admin to view this page. Sign in with the admin access code.</div>
+
+  <div id="adminUI" style="display:none">
+    <div class="tabs">
+      <button class="tab active" data-tab="members">Members</button>
+      <button class="tab" data-tab="tasks">Tasks</button>
+    </div>
+
+    <div class="section active" id="members-section">
+      <div class="section-header">
+        <div class="section-title">Members (<span id="memberCount">0</span>)</div>
+        <button class="btn btn-ghost btn-sm" onclick="loadMembers()">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Name</th><th>Slack ID</th><th>Admin</th><th>Created</th><th></th></tr>
+        </thead>
+        <tbody id="membersBody"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="section" id="tasks-section">
+      <div class="section-header">
+        <div class="section-title">All Tasks (<span id="taskCount">0</span>)</div>
+        <button class="btn btn-ghost btn-sm" onclick="loadTasks()">Refresh</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Title</th><th>Assignee</th><th>Status</th><th>Priority</th><th>Created</th><th></th></tr>
+        </thead>
+        <tbody id="tasksBody"><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+
+function toast(msg, kind = 'success') {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + kind;
+  setTimeout(() => t.classList.remove('show'), 2400);
+}
+
+async function api(method, path, body) {
+  const opts = { method, credentials: 'include', headers: { 'Accept': 'application/json' } };
+  if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  const res = await fetch(path, opts);
+  if (res.status === 401) { window.location.href = '/login'; return null; }
+  if (res.status === 403) { showForbidden(); return null; }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `${method} ${path} failed (${res.status})`);
+  return data;
+}
+
+function showForbidden() {
+  $('#forbidden').style.display = 'block';
+  $('#adminUI').style.display = 'none';
+}
+
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.section').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    $('#' + t.dataset.tab + '-section').classList.add('active');
+    if (t.dataset.tab === 'tasks') loadTasks();
+    if (t.dataset.tab === 'members') loadMembers();
+  });
+});
+
+function fmtDate(s) { if (!s) return '—'; try { return new Date(s).toLocaleDateString(); } catch { return s; } }
+function escapeHtml(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
+
+async function loadMembers() {
+  const tbody = $('#membersBody');
+  tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading…</td></tr>';
+  try {
+    const members = await api('GET', '/api/admin/members');
+    if (!members) return;
+    $('#memberCount').textContent = members.length;
+    if (!members.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">No members yet</td></tr>'; return; }
+    tbody.innerHTML = members.map(m => `
+      <tr data-id="${m.id}">
+        <td>
+          <span class="avatar" style="background:${m.avatar_color || '#6366f1'}">${escapeHtml((m.name || '?').slice(0,2).toUpperCase())}</span>
+          <input type="text" value="${escapeHtml(m.name)}" data-field="name" />
+        </td>
+        <td><span class="muted">${escapeHtml(m.slack_id || '—')}</span></td>
+        <td><label class="checkbox-cell"><input type="checkbox" data-field="is_admin" ${m.is_admin ? 'checked' : ''} /> ${m.is_admin ? '<span class="pill admin">Admin</span>' : ''}</label></td>
+        <td class="muted">${fmtDate(m.created_at)}</td>
+        <td class="actions">
+          <button class="btn btn-sm" onclick="saveMember(${m.id})">Save</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteMember(${m.id})">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+  } catch (e) { tbody.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(e.message)}</td></tr>`; }
+}
+
+async function saveMember(id) {
+  const row = document.querySelector(`#membersBody tr[data-id="${id}"]`);
+  const body = {
+    name: row.querySelector('[data-field="name"]').value.trim(),
+    is_admin: row.querySelector('[data-field="is_admin"]').checked,
+  };
+  try { await api('PUT', `/api/admin/members/${id}`, body); toast('Member saved'); loadMembers(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+async function deleteMember(id) {
+  if (!confirm('Delete this member? Their tasks will be unassigned.')) return;
+  try { await api('DELETE', `/api/admin/members/${id}`); toast('Member deleted'); loadMembers(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+async function loadTasks() {
+  const tbody = $('#tasksBody');
+  tbody.innerHTML = '<tr><td colspan="6" class="empty">Loading…</td></tr>';
+  try {
+    const tasks = await api('GET', '/api/admin/tasks');
+    if (!tasks) return;
+    $('#taskCount').textContent = tasks.length;
+    if (!tasks.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">No tasks yet</td></tr>'; return; }
+    tbody.innerHTML = tasks.map(t => `
+      <tr data-id="${t.id}">
+        <td><input type="text" value="${escapeHtml(t.title)}" data-field="title" style="min-width:280px" /></td>
+        <td class="muted">${escapeHtml(t.member_name || '—')}</td>
+        <td>
+          <select data-field="status">
+            ${['todo','in_progress','review','done'].map(s => `<option value="${s}" ${t.status===s?'selected':''}>${s}</option>`).join('')}
+          </select>
+        </td>
+        <td>
+          <select data-field="priority">
+            ${['low','medium','high','urgent'].map(p => `<option value="${p}" ${t.priority===p?'selected':''}>${p}</option>`).join('')}
+          </select>
+        </td>
+        <td class="muted">${fmtDate(t.created_at)}</td>
+        <td class="actions">
+          <button class="btn btn-sm" onclick="saveTask(${t.id})">Save</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteTask(${t.id})">Delete</button>
+        </td>
+      </tr>
+    `).join('');
+  } catch (e) { tbody.innerHTML = `<tr><td colspan="6" class="empty">Error: ${escapeHtml(e.message)}</td></tr>`; }
+}
+
+async function saveTask(id) {
+  const row = document.querySelector(`#tasksBody tr[data-id="${id}"]`);
+  const body = {
+    title: row.querySelector('[data-field="title"]').value.trim(),
+    status: row.querySelector('[data-field="status"]').value,
+    priority: row.querySelector('[data-field="priority"]').value,
+  };
+  try { await api('PUT', `/api/admin/tasks/${id}`, body); toast('Task saved'); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+async function deleteTask(id) {
+  if (!confirm('Delete this task permanently?')) return;
+  try { await api('DELETE', `/api/admin/tasks/${id}`); toast('Task deleted'); loadTasks(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+(async function init() {
+  try {
+    const me = await api('GET', '/api/me');
+    if (!me) return;
+    if (!me.is_admin) { showForbidden(); return; }
+    $('#adminUI').style.display = 'block';
+    loadMembers();
+  } catch (e) { showForbidden(); }
+})();
+</script>
+</body>
+</html>

@@ -5,22 +5,62 @@ const path = require('path');
 const cookieParser = require('cookie-parser');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 const { initDatabase, getDB } = require('./db');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const IS_PROD = process.env.NODE_ENV === 'production';
 
 // ---------------------------------------------------------------------------
 // Authentication Config
 // ---------------------------------------------------------------------------
+if (IS_PROD) {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET must be set in production.');
+  }
+  if (!process.env.TEAM_ACCESS_CODE) {
+    throw new Error('TEAM_ACCESS_CODE must be set in production.');
+  }
+} else {
+  if (!process.env.JWT_SECRET) console.warn('[WARN] JWT_SECRET not set — using insecure dev default.');
+  if (!process.env.TEAM_ACCESS_CODE) console.warn('[WARN] TEAM_ACCESS_CODE not set — using insecure dev default.');
+}
+
 const TEAM_ACCESS_CODE = process.env.TEAM_ACCESS_CODE || 'winningcircle-dev';
 const ADMIN_ACCESS_CODE = process.env.ADMIN_ACCESS_CODE || null;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-jwt-secret-CHANGE-IN-PRODUCTION';
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
 // ---------------------------------------------------------------------------
+// Async route wrapper
+// ---------------------------------------------------------------------------
+const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// ---------------------------------------------------------------------------
+// Input validation helpers
+// ---------------------------------------------------------------------------
+const TITLE_MAX = 200;
+const TEXT_MAX = 5000;
+const ALLOWED_STATUS = ['todo', 'in_progress', 'review', 'done'];
+const ALLOWED_PRIORITY = ['low', 'medium', 'high', 'urgent'];
+
+function isStr(v) { return typeof v === 'string'; }
+function isOptStr(v) { return v === undefined || v === null || typeof v === 'string'; }
+
+// ---------------------------------------------------------------------------
 // Middleware (skip JSON body parsing for /slack/ — Bolt handles its own)
 // ---------------------------------------------------------------------------
+app.set('trust proxy', 1);
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+      "script-src": ["'self'", "'unsafe-inline'"],
+      "script-src-attr": ["'unsafe-inline'"],
+    },
+  },
+}));
 app.use(cors({ credentials: true, origin: BASE_URL }));
 app.use((req, res, next) => {
   if (req.originalUrl.startsWith('/slack/')) return next();
@@ -85,20 +125,47 @@ app.get('/auth/login', (req, res) => {
 });
 
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 10,
+  windowMs: 15 * 60 * 1000,
+  max: 5,
   message: { error: 'Too many login attempts. Try again in 15 minutes.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-app.post('/auth/login', loginLimiter, async (req, res) => {
-  const { name, accessCode } = req.body;
-  if (!name || !accessCode) {
+const perNameAttempts = new Map();
+const PER_NAME_WINDOW_MS = 15 * 60 * 1000;
+const PER_NAME_MAX = 5;
+function checkPerName(name) {
+  const key = name.trim().toLowerCase();
+  const now = Date.now();
+  const entry = perNameAttempts.get(key);
+  if (!entry || entry.resetAt <= now) {
+    perNameAttempts.set(key, { count: 1, resetAt: now + PER_NAME_WINDOW_MS });
+    return true;
+  }
+  entry.count += 1;
+  return entry.count <= PER_NAME_MAX;
+}
+
+const SLACK_ID_RE = /^[UW][A-Z0-9]{7,11}$/;
+
+app.post('/auth/login', loginLimiter, wrap(async (req, res) => {
+  const { name, accessCode, slackId } = req.body || {};
+  if (!isStr(name) || !isStr(accessCode) || !name.trim() || !accessCode) {
     return res.status(400).json({ error: 'Name and Access Code are required.' });
   }
+  if (name.length > 200) {
+    return res.status(400).json({ error: 'Name too long.' });
+  }
+  if (slackId !== undefined && slackId !== null && slackId !== '' && (!isStr(slackId) || !SLACK_ID_RE.test(slackId.trim()))) {
+    return res.status(400).json({ error: 'Slack ID must look like U01ABC23DEF (starts with U or W, 8–12 chars, A–Z 0–9).' });
+  }
+  const cleanSlackId = isStr(slackId) ? slackId.trim() : '';
+  if (!checkPerName(name)) {
+    return res.status(429).json({ error: 'Too many login attempts for this name. Try again later.' });
+  }
 
-  const isAdminLogin = ADMIN_ACCESS_CODE && accessCode === ADMIN_ACCESS_CODE;
+  const isAdminLogin = !!(ADMIN_ACCESS_CODE && accessCode === ADMIN_ACCESS_CODE);
   const isTeamLogin  = accessCode === TEAM_ACCESS_CODE;
   if (!isAdminLogin && !isTeamLogin) {
     return res.status(401).json({ error: 'Invalid access code.' });
@@ -113,36 +180,59 @@ app.post('/auth/login', loginLimiter, async (req, res) => {
   );
 
   if (!member) {
+    if (!cleanSlackId) {
+      return res.status(400).json({ error: 'Slack ID is required to register. Find yours in Slack → Profile → ⋯ → Copy member ID.' });
+    }
+    const conflict = allMembers.find(m => m.slack_id === cleanSlackId);
+    if (conflict) {
+      return res.status(409).json({ error: `Slack ID already registered to "${conflict.name}".` });
+    }
     const colors = ['#6366f1', '#8b5cf6', '#ec4899', '#f43f5e', '#f97316', '#eab308', '#22c55e', '#06b6d4'];
     const color = colors[allMembers.length % colors.length];
     const info = await db.run(
-      'INSERT INTO members (name, avatar_color) VALUES (?, ?)',
-      [trimmedName, color]
+      'INSERT INTO members (name, slack_id, avatar_color, is_admin) VALUES (?, ?, ?, ?)',
+      [trimmedName, cleanSlackId, color, isAdminLogin ? 1 : 0]
     );
     member = await db.get('SELECT * FROM members WHERE id = ?', [info.lastInsertRowid]);
+  } else {
+    if (cleanSlackId) {
+      if (member.slack_id && member.slack_id !== cleanSlackId) {
+        return res.status(409).json({ error: 'This name is already linked to a different Slack ID. Contact an admin.' });
+      }
+      if (!member.slack_id) {
+        const conflict = allMembers.find(m => m.id !== member.id && m.slack_id === cleanSlackId);
+        if (conflict) {
+          return res.status(409).json({ error: `Slack ID already registered to "${conflict.name}".` });
+        }
+        await db.run('UPDATE members SET slack_id = ? WHERE id = ?', [cleanSlackId, member.id]);
+        member.slack_id = cleanSlackId;
+      }
+    }
+    if (isAdminLogin && !member.is_admin) {
+      await db.run('UPDATE members SET is_admin = 1 WHERE id = ?', [member.id]);
+      member.is_admin = 1;
+    }
   }
 
-  // Persist admin flag if logging in with admin code
-  if (isAdminLogin && !member.is_admin) {
-    await db.run('UPDATE members SET is_admin = 1 WHERE id = ?', [member.id]);
-    member.is_admin = 1;
-  }
+  // is_admin on the JWT is ONLY true when the admin code was used for THIS login.
+  // Team-code logins never elevate, regardless of stored DB flag.
+  const tokenIsAdmin = isAdminLogin === true;
 
   const token = jwt.sign(
-    { name: member.name, member_id: member.id, is_admin: member.is_admin === 1 },
+    { name: member.name, member_id: member.id, is_admin: tokenIsAdmin },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
 
   res.cookie('wc_token', token, {
     httpOnly: true,
-    secure: req.secure || req.headers['x-forwarded-proto'] === 'https',
+    secure: IS_PROD,
     sameSite: 'lax',
     maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 
   res.json({ success: true });
-});
+}));
 
 app.get('/auth/logout', (req, res) => {
   res.clearCookie('wc_token');
@@ -161,6 +251,10 @@ app.get('/board', requireAuth, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'board.html'));
 });
 
+app.get('/admin', requireAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+});
+
 // ---------------------------------------------------------------------------
 // Protect all /api/* routes
 // ---------------------------------------------------------------------------
@@ -169,29 +263,36 @@ app.use('/api', requireAuth);
 // ---------------------------------------------------------------------------
 // API — Me (current user from JWT)
 // ---------------------------------------------------------------------------
-app.get('/api/me', async (req, res) => {
+app.get('/api/me', wrap(async (req, res) => {
   const db = getDB();
   const member = await db.get('SELECT * FROM members WHERE id = ?', [req.user.member_id]);
   res.json({
     name: req.user.name,
     member_id: req.user.member_id,
-    is_admin: req.user.is_admin || false,
+    is_admin: !!(req.user.is_admin && member && member.is_admin),
     avatar_color: member?.avatar_color || '#6366f1',
   });
-});
+}));
 
 // ---------------------------------------------------------------------------
-// Admin middleware
+// Admin middleware — verifies BOTH the JWT claim and the live DB flag.
 // ---------------------------------------------------------------------------
 function requireAdmin(req, res, next) {
-  if (!req.user?.is_admin) return res.status(403).json({ error: 'Admin access required.' });
-  next();
+  (async () => {
+    if (!req.user?.is_admin) return res.status(403).json({ error: 'Admin access required.' });
+    const db = getDB();
+    const member = await db.get('SELECT is_admin FROM members WHERE id = ?', [req.user.member_id]);
+    if (!member || !member.is_admin) {
+      return res.status(403).json({ error: 'Admin access required.' });
+    }
+    next();
+  })().catch(next);
 }
 
 // ---------------------------------------------------------------------------
 // Admin API — Members
 // ---------------------------------------------------------------------------
-app.get('/api/admin/members', requireAuth, requireAdmin, async (req, res) => {
+app.get('/api/admin/members', requireAuth, requireAdmin, wrap(async (req, res) => {
   const db = getDB();
   const members = await db.all(`
     SELECT m.*,
@@ -202,9 +303,9 @@ app.get('/api/admin/members', requireAuth, requireAdmin, async (req, res) => {
     GROUP BY m.id ORDER BY m.name
   `);
   res.json(members);
-});
+}));
 
-app.put('/api/admin/members/:id', requireAuth, requireAdmin, async (req, res) => {
+app.put('/api/admin/members/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
   const db = getDB();
   const id = parseInt(req.params.id);
   const { name, slack_id, avatar_color, is_admin } = req.body;
@@ -219,20 +320,20 @@ app.put('/api/admin/members/:id', requireAuth, requireAdmin, async (req, res) =>
      avatar_color || null, is_admin !== undefined ? (is_admin ? 1 : 0) : null, id]
   );
   res.json(await db.get('SELECT * FROM members WHERE id = ?', [id]));
-});
+}));
 
-app.delete('/api/admin/members/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/admin/members/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
   const db = getDB();
   const id = parseInt(req.params.id);
   if (id === req.user.member_id) return res.status(400).json({ error: "Can't delete your own account." });
   await db.run('DELETE FROM members WHERE id = ?', [id]);
   res.json({ success: true });
-});
+}));
 
 // ---------------------------------------------------------------------------
 // Admin API — Tasks (full access, no ownership filter)
 // ---------------------------------------------------------------------------
-app.get('/api/admin/tasks', requireAuth, requireAdmin, async (req, res) => {
+app.get('/api/admin/tasks', requireAuth, requireAdmin, wrap(async (req, res) => {
   const db = getDB();
   const { status, member_id } = req.query;
   let sql = `SELECT t.*, m.name as member_name, m.avatar_color
@@ -242,9 +343,9 @@ app.get('/api/admin/tasks', requireAuth, requireAdmin, async (req, res) => {
   if (member_id) { sql += ' AND t.member_id = ?'; params.push(parseInt(member_id)); }
   sql += ` ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, t.updated_at DESC`;
   res.json(await db.all(sql, params));
-});
+}));
 
-app.put('/api/admin/tasks/:id', requireAuth, requireAdmin, async (req, res) => {
+app.put('/api/admin/tasks/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
   const db = getDB();
   const taskId = parseInt(req.params.id);
   const existing = await db.get('SELECT * FROM tasks WHERE id = ?', [taskId]);
@@ -267,53 +368,59 @@ app.put('/api/admin/tasks/:id', requireAuth, requireAdmin, async (req, res) => {
   res.json(await db.get(
     'SELECT t.*, m.name as member_name, m.avatar_color FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE t.id = ?',
     [taskId]));
-});
+}));
 
-app.delete('/api/admin/tasks/:id', requireAuth, requireAdmin, async (req, res) => {
+app.delete('/api/admin/tasks/:id', requireAuth, requireAdmin, wrap(async (req, res) => {
   const db = getDB();
   await db.run('DELETE FROM tasks WHERE id = ?', [parseInt(req.params.id)]);
   res.json({ success: true });
-});
+}));
 
 // ---------------------------------------------------------------------------
 // API — Members
 // ---------------------------------------------------------------------------
-app.get('/api/members', async (req, res) => {
+app.get('/api/members', wrap(async (req, res) => {
   const db = getDB();
   res.json(await db.all('SELECT * FROM members ORDER BY name'));
-});
+}));
 
-app.post('/api/members', async (req, res) => {
+app.post('/api/members', requireAdmin, wrap(async (req, res) => {
   const db = getDB();
-  const { name, slack_id, avatar_color } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name is required' });
+  const { name, slack_id, avatar_color } = req.body || {};
+  if (!isStr(name) || !name.trim()) return res.status(400).json({ error: 'Name is required' });
+  if (name.length > 200) return res.status(400).json({ error: 'Name too long' });
+  if (!isOptStr(slack_id) || !isOptStr(avatar_color)) return res.status(400).json({ error: 'Invalid input' });
   const info = await db.run(
     'INSERT INTO members (name, slack_id, avatar_color) VALUES (?, ?, ?)',
-    [name, slack_id || null, avatar_color || '#6366f1']
+    [name.trim(), slack_id || null, avatar_color || '#6366f1']
   );
   res.status(201).json(await db.get('SELECT * FROM members WHERE id = ?', [info.lastInsertRowid]));
-});
+}));
 
-app.put('/api/members/:id', async (req, res) => {
+app.put('/api/members/:id', requireAdmin, wrap(async (req, res) => {
   const db = getDB();
-  const { name, slack_id, avatar_color } = req.body;
+  const { name, slack_id, avatar_color } = req.body || {};
+  if (!isOptStr(name) || !isOptStr(slack_id) || !isOptStr(avatar_color)) {
+    return res.status(400).json({ error: 'Invalid input' });
+  }
+  if (isStr(name) && name.length > 200) return res.status(400).json({ error: 'Name too long' });
   await db.run(
     'UPDATE members SET name = COALESCE(?, name), slack_id = COALESCE(?, slack_id), avatar_color = COALESCE(?, avatar_color) WHERE id = ?',
     [name || null, slack_id || null, avatar_color || null, parseInt(req.params.id)]
   );
   res.json(await db.get('SELECT * FROM members WHERE id = ?', [parseInt(req.params.id)]));
-});
+}));
 
-app.delete('/api/members/:id', async (req, res) => {
+app.delete('/api/members/:id', requireAdmin, wrap(async (req, res) => {
   const db = getDB();
   await db.run('DELETE FROM members WHERE id = ?', [parseInt(req.params.id)]);
   res.json({ success: true });
-});
+}));
 
 // ---------------------------------------------------------------------------
 // API — Tasks
 // ---------------------------------------------------------------------------
-app.get('/api/tasks', async (req, res) => {
+app.get('/api/tasks', wrap(async (req, res) => {
   const db = getDB();
   const { status, member_id } = req.query;
   let sql = `SELECT t.*, m.name as member_name, m.avatar_color
@@ -323,13 +430,26 @@ app.get('/api/tasks', async (req, res) => {
   if (member_id) { sql += ' AND t.member_id = ?'; params.push(parseInt(member_id)); }
   sql += ` ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, t.updated_at DESC`;
   res.json(await db.all(sql, params));
-});
+}));
 
-app.post('/api/tasks', async (req, res) => {
+app.post('/api/tasks', wrap(async (req, res) => {
   const db = getDB();
-  const { title, description, status, priority, due_date } = req.body;
-  if (!title) return res.status(400).json({ error: 'Title is required' });
-  // Always assign to the logged-in user
+  const { title, description, status, priority, due_date } = req.body || {};
+  if (!isStr(title) || !title.trim()) return res.status(400).json({ error: 'Title is required' });
+  if (title.length > TITLE_MAX) return res.status(400).json({ error: `Title must be <= ${TITLE_MAX} chars` });
+  if (description !== undefined && description !== null) {
+    if (!isStr(description)) return res.status(400).json({ error: 'Invalid description' });
+    if (description.length > TEXT_MAX) return res.status(400).json({ error: `Description must be <= ${TEXT_MAX} chars` });
+  }
+  if (status !== undefined && status !== null && !ALLOWED_STATUS.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  if (priority !== undefined && priority !== null && !ALLOWED_PRIORITY.includes(priority)) {
+    return res.status(400).json({ error: 'Invalid priority' });
+  }
+  if (due_date !== undefined && due_date !== null && !isStr(due_date)) {
+    return res.status(400).json({ error: 'Invalid due_date' });
+  }
   const memberId = req.user.member_id;
   const info = await db.run(
     'INSERT INTO tasks (title, description, status, priority, member_id, due_date) VALUES (?, ?, ?, ?, ?, ?)',
@@ -343,9 +463,9 @@ app.post('/api/tasks', async (req, res) => {
     'SELECT t.*, m.name as member_name, m.avatar_color FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE t.id = ?',
     [info.lastInsertRowid]
   ));
-});
+}));
 
-app.put('/api/tasks/:id', async (req, res) => {
+app.put('/api/tasks/:id', wrap(async (req, res) => {
   const db = getDB();
   const taskId = parseInt(req.params.id);
   const existing = await db.get('SELECT * FROM tasks WHERE id = ?', [taskId]);
@@ -356,7 +476,24 @@ app.put('/api/tasks/:id', async (req, res) => {
     return res.status(403).json({ error: 'You can only edit your own tasks.' });
   }
 
-  const { title, description, status, priority, due_date } = req.body;
+  const { title, description, status, priority, due_date } = req.body || {};
+  if (title !== undefined && title !== null) {
+    if (!isStr(title) || !title.trim()) return res.status(400).json({ error: 'Invalid title' });
+    if (title.length > TITLE_MAX) return res.status(400).json({ error: `Title must be <= ${TITLE_MAX} chars` });
+  }
+  if (description !== undefined && description !== null) {
+    if (!isStr(description)) return res.status(400).json({ error: 'Invalid description' });
+    if (description.length > TEXT_MAX) return res.status(400).json({ error: `Description must be <= ${TEXT_MAX} chars` });
+  }
+  if (status !== undefined && status !== null && !ALLOWED_STATUS.includes(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+  if (priority !== undefined && priority !== null && !ALLOWED_PRIORITY.includes(priority)) {
+    return res.status(400).json({ error: 'Invalid priority' });
+  }
+  if (due_date !== undefined && due_date !== null && !isStr(due_date)) {
+    return res.status(400).json({ error: 'Invalid due_date' });
+  }
   const newStatus = status || existing.status;
   const completedAt = newStatus === 'done' && existing.status !== 'done'
     ? new Date().toISOString() : existing.completed_at;
@@ -385,9 +522,9 @@ app.put('/api/tasks/:id', async (req, res) => {
     'SELECT t.*, m.name as member_name, m.avatar_color FROM tasks t LEFT JOIN members m ON t.member_id = m.id WHERE t.id = ?',
     [taskId]
   ));
-});
+}));
 
-app.delete('/api/tasks/:id', async (req, res) => {
+app.delete('/api/tasks/:id', wrap(async (req, res) => {
   const db = getDB();
   const task = await db.get('SELECT * FROM tasks WHERE id = ?', [parseInt(req.params.id)]);
   if (!task) return res.status(404).json({ error: 'Task not found' });
@@ -398,12 +535,12 @@ app.delete('/api/tasks/:id', async (req, res) => {
   }
   await db.run('DELETE FROM tasks WHERE id = ?', [parseInt(req.params.id)]);
   res.json({ success: true });
-});
+}));
 
 // ---------------------------------------------------------------------------
 // API — Dashboard Stats
 // ---------------------------------------------------------------------------
-app.get('/api/stats', async (req, res) => {
+app.get('/api/stats', wrap(async (req, res) => {
   const db = getDB();
   const tasksByStatus = await db.all('SELECT status, COUNT(*) as count FROM tasks GROUP BY status');
   const tasksByMember = await db.all(`
@@ -426,12 +563,12 @@ app.get('/api/stats', async (req, res) => {
   const completedToday = await db.get("SELECT COUNT(*) as count FROM tasks WHERE completed_at >= date('now')");
 
   res.json({ tasksByStatus, tasksByMember, recentActivity, completedToday: completedToday?.count || 0 });
-});
+}));
 
 // ---------------------------------------------------------------------------
 // API — Daily Updates
 // ---------------------------------------------------------------------------
-app.get('/api/daily-updates', async (req, res) => {
+app.get('/api/daily-updates', wrap(async (req, res) => {
   const db = getDB();
   const { date } = req.query;
   const targetDate = date || new Date().toISOString().split('T')[0];
@@ -440,22 +577,27 @@ app.get('/api/daily-updates', async (req, res) => {
     FROM daily_updates d JOIN members m ON d.member_id = m.id
     WHERE d.date = ? ORDER BY m.name
   `, [targetDate]));
-});
+}));
 
-app.post('/api/daily-updates', async (req, res) => {
+app.post('/api/daily-updates', wrap(async (req, res) => {
   const db = getDB();
-  const { done_summary, working_on_summary, blockers } = req.body;
+  const { done_summary, working_on_summary, blockers } = req.body || {};
+  for (const [field, val] of [['done_summary', done_summary], ['working_on_summary', working_on_summary], ['blockers', blockers]]) {
+    if (val === undefined || val === null) continue;
+    if (!isStr(val)) return res.status(400).json({ error: `Invalid ${field}` });
+    if (val.length > TEXT_MAX) return res.status(400).json({ error: `${field} must be <= ${TEXT_MAX} chars` });
+  }
   const date = new Date().toISOString().split('T')[0];
   await db.run(`INSERT OR REPLACE INTO daily_updates (member_id, date, done_summary, working_on_summary, blockers)
     VALUES (?, ?, ?, ?, ?)`,
-    [req.user.member_id, date, done_summary, working_on_summary, blockers]);
+    [req.user.member_id, date, done_summary || null, working_on_summary || null, blockers || null]);
   res.json({ success: true });
-});
+}));
 
 // ---------------------------------------------------------------------------
 // API — Activity Log
 // ---------------------------------------------------------------------------
-app.get('/api/activity', async (req, res) => {
+app.get('/api/activity', wrap(async (req, res) => {
   const db = getDB();
   const limit = parseInt(req.query.limit) || 50;
   res.json(await db.all(`
@@ -465,7 +607,7 @@ app.get('/api/activity', async (req, res) => {
     LEFT JOIN members m ON a.member_id = m.id
     ORDER BY a.created_at DESC LIMIT ?
   `, [limit]));
-});
+}));
 
 // ---------------------------------------------------------------------------
 // Static assets — CSS, JS, images, etc. (no index.html since / is handled above)
@@ -480,6 +622,15 @@ app.use(express.static(path.join(__dirname, 'public'), {
 // ---------------------------------------------------------------------------
 app.get('*', requireAuth, (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ---------------------------------------------------------------------------
+// Global error handler
+// ---------------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  console.error(err);
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // ---------------------------------------------------------------------------
